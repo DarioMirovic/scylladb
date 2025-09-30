@@ -22,6 +22,8 @@
 #include <seastar/core/abort_source.hh>
 #include <fmt/format.h>
 #include <signal.h>
+#include <iomanip>
+#include <limits>
 
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string.hpp>
@@ -381,6 +383,9 @@ struct shard_conn_stats {
     uint64_t successes = 0;
     uint64_t failures = 0;
     uint64_t total_latency_ns = 0; // sum of startup() latency
+    uint64_t min_latency_ns = std::numeric_limits<uint64_t>::max();
+    uint64_t max_latency_ns = 0;
+    utils::estimated_histogram auth_hist{160}; // store latency samples (microseconds) for percentile estimation
 };
 static thread_local shard_conn_stats tl_conn_stats; // only updated on shards running the driver
 
@@ -389,16 +394,30 @@ struct aggregated_conn_stats {
     uint64_t attempts = 0;
     uint64_t successes = 0;
     uint64_t failures = 0;
-    double realized_rate = 0.0;      // successes per second
-    double avg_startup_latency_ms = 0.0; // average startup() latency
+    double throughput = 0.0; // successes per second
+    double avg_startup_latency_us = 0.0; // average startup() latency in microseconds
+    double median_startup_latency_us = 0.0; // median
+    double p99_startup_latency_us = 0.0;
+    double min_startup_latency_us = std::numeric_limits<double>::max();
+    double max_startup_latency_us = 0.0;
+    utils::estimated_histogram auth_hist{160};
 };
 
 static std::ostream& operator<<(std::ostream& os, const aggregated_conn_stats& s) {
-    return os << "AUTH connections summary: attempts=" << s.attempts
-              << ", successes=" << s.successes
-              << ", failures=" << s.failures
-              << ", realized_rate=" << s.realized_rate << " conn/s"
-              << ", avg_startup_latency_ms=" << s.avg_startup_latency_ms;
+    // Follow formatting style used in perf_result (multi-line, aligned) for readability.
+    os << "auth_startup_latency:\n";
+    if (s.successes) {
+        os << "        mean="   << std::setw(10) << std::fixed << std::setprecision(3) << s.avg_startup_latency_us << "\n";
+        os << "        median=" << std::setw(10) << std::fixed << std::setprecision(3) << s.median_startup_latency_us << "\n";
+        os << "        p99="    << std::setw(10) << std::fixed << std::setprecision(3) << s.p99_startup_latency_us << "\n";
+        os << "        min="    << std::setw(10) << std::fixed << std::setprecision(3) << (s.min_startup_latency_us == std::numeric_limits<double>::max() ? 0.0 : s.min_startup_latency_us) << "\n";
+        os << "        max="    << std::setw(10) << std::fixed << std::setprecision(3) << s.max_startup_latency_us << "\n";
+    } else {
+        os << "        (no successful AUTH samples)\n";
+    }
+    os << "auth_connections:\n";
+    os << "        throughput=" << std::fixed << std::setprecision(2) << s.throughput << " conn/s";
+    return os;
 }
 
 // Start background connection/auth drivers based on config. Populates 'futs' with the running tasks.
@@ -435,7 +454,14 @@ static void start_connection_drivers(const raw_cql_test_config& cfg, seastar::ab
                     co_await c.startup();
                     auto auth_end = lowres_clock::now();
                     ++tl_conn_stats.successes;
-                    tl_conn_stats.total_latency_ns += (auth_end - auth_start).count();
+                    auto dur_ns = (auth_end - auth_start).count();
+                    tl_conn_stats.total_latency_ns += dur_ns;
+                    tl_conn_stats.min_latency_ns = std::min(tl_conn_stats.min_latency_ns, (uint64_t)dur_ns);
+                    tl_conn_stats.max_latency_ns = std::max(tl_conn_stats.max_latency_ns, (uint64_t)dur_ns);
+                    // Record microseconds in histogram for better bucket coverage
+                    auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(auth_end - auth_start).count();
+                    if (dur_us <= 0) { dur_us = 1; }
+                    tl_conn_stats.auth_hist.add(dur_us);
                 } catch (...) {
                     ++tl_conn_stats.failures;
                     if (!cfg.continue_after_error) {
@@ -481,14 +507,27 @@ static aggregated_conn_stats aggregate_connection_stats(const raw_cql_test_confi
         agg.attempts += shard_stats.attempts;
         agg.successes += shard_stats.successes;
         agg.failures += shard_stats.failures;
-        agg.realized_rate += 0.0; // placeholder, computed after loop
-        agg.avg_startup_latency_ms += shard_stats.total_latency_ns; // accumulate raw ns for now
+        agg.avg_startup_latency_us += shard_stats.total_latency_ns; // accumulate raw ns temporarily (will convert)
+        if (shard_stats.min_latency_ns != std::numeric_limits<uint64_t>::max()) {
+            agg.min_startup_latency_us = std::min(agg.min_startup_latency_us, double(shard_stats.min_latency_ns) / 1000.0);
+        }
+        agg.max_startup_latency_us = std::max(agg.max_startup_latency_us, double(shard_stats.max_latency_ns) / 1000.0);
+        agg.auth_hist.merge(shard_stats.auth_hist);
     }
     double duration = cfg.duration_in_seconds ? cfg.duration_in_seconds : 1.0;
     // avg_startup_latency_ms currently holds total latency in ns; convert
-    uint64_t total_latency_ns = static_cast<uint64_t>(agg.avg_startup_latency_ms);
-    agg.realized_rate = duration ? double(agg.successes) / duration : 0.0;
-    agg.avg_startup_latency_ms = agg.successes ? (double(total_latency_ns) / 1e6 / agg.successes) : 0.0;
+    uint64_t total_latency_ns = static_cast<uint64_t>(agg.avg_startup_latency_us);
+    agg.throughput = duration ? double(agg.successes) / duration : 0.0;
+    agg.avg_startup_latency_us = agg.successes ? (double(total_latency_ns) / 1000.0 / agg.successes) : 0.0; // ns -> us
+    if (agg.min_startup_latency_us == std::numeric_limits<double>::max()) {
+        agg.min_startup_latency_us = 0.0; // no samples
+    }
+    if (agg.auth_hist.count()) {
+        auto p99_us = agg.auth_hist.percentile(0.99);
+        agg.p99_startup_latency_us = double(p99_us);
+        auto p50_us = agg.auth_hist.percentile(0.50);
+        agg.median_startup_latency_us = double(p50_us);
+    }
     return agg;
 }
 
