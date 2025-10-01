@@ -24,6 +24,9 @@
 #include <signal.h>
 #include <iomanip>
 #include <limits>
+#include <cmath>
+#include <vector>
+#include <algorithm>
 
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string.hpp>
@@ -43,6 +46,8 @@ using namespace cql_transport;
 // Small hand and AI crafted CQL client that  builds raw
 // frames directly and sends over a tcp connection to exercise the full
 // CQL binary protocol parsing path without any external driver layers.
+
+using uint128_t = unsigned __int128;
 
 struct raw_cql_test_config {
     std::string workload; // read | write
@@ -382,9 +387,10 @@ struct shard_conn_stats {
     uint64_t attempts = 0;
     uint64_t successes = 0;
     uint64_t failures = 0;
-    uint64_t total_latency_ns = 0; // sum of startup() latency
-    uint64_t min_latency_ns = std::numeric_limits<uint64_t>::max();
-    uint64_t max_latency_ns = 0;
+    uint64_t min_latency_us = std::numeric_limits<uint64_t>::max();
+    uint64_t max_latency_us = 0;
+    uint64_t total_latency_us = 0;      // sum of latencies in microseconds
+    uint128_t total_latency_us_sq = 0;   // sum of squares for stddev (us^2)
     utils::estimated_histogram auth_hist{160}; // store latency samples (microseconds) for percentile estimation
 };
 static thread_local shard_conn_stats tl_conn_stats; // only updated on shards running the driver
@@ -401,14 +407,19 @@ struct aggregated_conn_stats {
     double min_startup_latency_us = std::numeric_limits<double>::max();
     double max_startup_latency_us = 0.0;
     utils::estimated_histogram auth_hist{160};
+    double stddev_startup_latency_us = 0.0; // population stddev
+    double mad_startup_latency_us = 0.0;    // median absolute deviation
+    uint128_t total_latency_us_sum = 0;    // for mean/stddev
+    uint128_t total_latency_us_sq_sum = 0; // for stddev
 };
 
 static std::ostream& operator<<(std::ostream& os, const aggregated_conn_stats& s) {
-    // Follow formatting style used in perf_result (multi-line, aligned) for readability.
     os << "auth_startup_latency:\n";
     if (s.successes) {
-        os << "        mean="   << std::setw(10) << std::fixed << std::setprecision(3) << s.avg_startup_latency_us << "\n";
-        os << "        median=" << std::setw(10) << std::fixed << std::setprecision(3) << s.median_startup_latency_us << "\n";
+        os << "        mean="   << std::setw(10) << std::fixed << std::setprecision(3) << s.avg_startup_latency_us
+           << " standard-deviation=" << std::setw(10) << std::fixed << std::setprecision(3) << s.stddev_startup_latency_us << "\n";
+        os << "        median=" << std::setw(10) << std::fixed << std::setprecision(3) << s.median_startup_latency_us
+           << " median-absolute-deviation=" << std::setw(10) << std::fixed << std::setprecision(3) << s.mad_startup_latency_us << "\n";
         os << "        p99="    << std::setw(10) << std::fixed << std::setprecision(3) << s.p99_startup_latency_us << "\n";
         os << "        min="    << std::setw(10) << std::fixed << std::setprecision(3) << (s.min_startup_latency_us == std::numeric_limits<double>::max() ? 0.0 : s.min_startup_latency_us) << "\n";
         os << "        max="    << std::setw(10) << std::fixed << std::setprecision(3) << s.max_startup_latency_us << "\n";
@@ -454,13 +465,13 @@ static void start_connection_drivers(const raw_cql_test_config& cfg, seastar::ab
                     co_await c.startup();
                     auto auth_end = lowres_clock::now();
                     ++tl_conn_stats.successes;
-                    auto dur_ns = (auth_end - auth_start).count();
-                    tl_conn_stats.total_latency_ns += dur_ns;
-                    tl_conn_stats.min_latency_ns = std::min(tl_conn_stats.min_latency_ns, (uint64_t)dur_ns);
-                    tl_conn_stats.max_latency_ns = std::max(tl_conn_stats.max_latency_ns, (uint64_t)dur_ns);
-                    // Record microseconds in histogram for better bucket coverage
+                    // Measure latency in microseconds (primary unit for stats/histogram)
                     auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(auth_end - auth_start).count();
                     if (dur_us <= 0) { dur_us = 1; }
+                    tl_conn_stats.min_latency_us = std::min(tl_conn_stats.min_latency_us, (uint64_t)dur_us);
+                    tl_conn_stats.max_latency_us = std::max(tl_conn_stats.max_latency_us, (uint64_t)dur_us);
+                    tl_conn_stats.total_latency_us += dur_us;
+                    tl_conn_stats.total_latency_us_sq += (uint128_t)dur_us * (uint128_t)dur_us;
                     tl_conn_stats.auth_hist.add(dur_us);
                 } catch (...) {
                     ++tl_conn_stats.failures;
@@ -498,6 +509,41 @@ static void stop_connection_drivers(seastar::abort_source& abort, std::vector<fu
     } catch (...) {}
 }
 
+// Approximate median absolute deviation from histogram and precomputed median.
+static double approximate_mad_us(const utils::estimated_histogram& h, double median_us) {
+    struct bucket_dev { double d; int64_t c; };
+    std::vector<bucket_dev> devs; devs.reserve(h.bucket_offsets.size());
+    int64_t total = 0;
+    for (size_t i = 0; i < h.bucket_offsets.size(); ++i) {
+        auto c = h.buckets[i];
+        if (!c) continue;
+        double lower = (i == 0) ? 1.0 : double(h.bucket_offsets[i-1]) + 1.0;
+        double upper = double(h.bucket_offsets[i]);
+        double rep = (lower + upper) * 0.5; // midpoint of bucket
+        devs.push_back({ std::fabs(rep - median_us), c });
+        total += c;
+    }
+    if (!total) return 0.0;
+    std::sort(devs.begin(), devs.end(), [](const bucket_dev& a, const bucket_dev& b){ return a.d < b.d; });
+    int64_t threshold = (total + 1) / 2;
+    int64_t acc = 0;
+    for (auto& b : devs) {
+        acc += b.c;
+        if (acc >= threshold) {
+            return b.d;
+        }
+    }
+    return devs.back().d;
+}
+
+// Convert a 128-bit unsigned integer to long double precisely (within IEEE 80-bit precision)
+static inline long double u128_to_long_double(uint128_t v) {
+    const long double two64 = 18446744073709551616.0L; // 2^64
+    uint64_t lo = (uint64_t)v;
+    uint64_t hi = (uint64_t)(v >> 64);
+    return (long double)hi * two64 + (long double)lo;
+}
+
 static aggregated_conn_stats aggregate_connection_stats(const raw_cql_test_config& cfg) {
     aggregated_conn_stats agg;
     for (unsigned s = 0; s < smp::count; ++s) {
@@ -507,26 +553,36 @@ static aggregated_conn_stats aggregate_connection_stats(const raw_cql_test_confi
         agg.attempts += shard_stats.attempts;
         agg.successes += shard_stats.successes;
         agg.failures += shard_stats.failures;
-        agg.avg_startup_latency_us += shard_stats.total_latency_ns; // accumulate raw ns temporarily (will convert)
-        if (shard_stats.min_latency_ns != std::numeric_limits<uint64_t>::max()) {
-            agg.min_startup_latency_us = std::min(agg.min_startup_latency_us, double(shard_stats.min_latency_ns) / 1000.0);
+        agg.total_latency_us_sum += shard_stats.total_latency_us;
+        agg.total_latency_us_sq_sum += shard_stats.total_latency_us_sq;
+        if (shard_stats.min_latency_us != std::numeric_limits<uint64_t>::max()) {
+            agg.min_startup_latency_us = std::min(agg.min_startup_latency_us, double(shard_stats.min_latency_us));
         }
-        agg.max_startup_latency_us = std::max(agg.max_startup_latency_us, double(shard_stats.max_latency_ns) / 1000.0);
+        agg.max_startup_latency_us = std::max(agg.max_startup_latency_us, double(shard_stats.max_latency_us));
         agg.auth_hist.merge(shard_stats.auth_hist);
     }
     double duration = cfg.duration_in_seconds ? cfg.duration_in_seconds : 1.0;
-    // avg_startup_latency_ms currently holds total latency in ns; convert
-    uint64_t total_latency_ns = static_cast<uint64_t>(agg.avg_startup_latency_us);
     agg.throughput = duration ? double(agg.successes) / duration : 0.0;
-    agg.avg_startup_latency_us = agg.successes ? (double(total_latency_ns) / 1000.0 / agg.successes) : 0.0; // ns -> us
+    if (agg.successes) {
+        long double n = (long double)agg.successes;
+        long double sum = u128_to_long_double(agg.total_latency_us_sum);
+        long double sum_sq = u128_to_long_double(agg.total_latency_us_sq_sum);
+        long double mean = sum / n;
+        agg.avg_startup_latency_us = (double)mean;
+        long double numerator = sum_sq - (sum * sum) / n; // sum of squared deviations
+        if (numerator < 0) numerator = 0; // numerical guard
+        long double variance = (n > 1) ? (numerator / (n - 1)) : 0; // sample variance
+        agg.stddev_startup_latency_us = std::sqrt((double)variance);
+    }
     if (agg.min_startup_latency_us == std::numeric_limits<double>::max()) {
-        agg.min_startup_latency_us = 0.0; // no samples
+        agg.min_startup_latency_us = 0.0;
     }
     if (agg.auth_hist.count()) {
         auto p99_us = agg.auth_hist.percentile(0.99);
         agg.p99_startup_latency_us = double(p99_us);
         auto p50_us = agg.auth_hist.percentile(0.50);
         agg.median_startup_latency_us = double(p50_us);
+        agg.mad_startup_latency_us = approximate_mad_us(agg.auth_hist, agg.median_startup_latency_us);
     }
     return agg;
 }
