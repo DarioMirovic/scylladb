@@ -64,6 +64,7 @@ struct raw_cql_test_config {
     unsigned connection_rate = 0; // target number of extra AUTH (connect+startup) handshakes per second (total or per shard)
     bool connection_rate_per_shard = false; // interpret connection_rate as per shard if true
     bool connection_on_all_shards = false; // run connection driver on all shards instead of shard 0 only
+    unsigned ops_rate = 0; // total logical operations per second limit (0 = unlimited)
 };
 
 std::ostream& operator<<(std::ostream& os, const raw_cql_test_config& c) {
@@ -72,6 +73,7 @@ std::ostream& operator<<(std::ostream& os, const raw_cql_test_config& c) {
               << ", concurrency=" << c.concurrency
               << ", duration=" << c.duration_in_seconds
               << ", ops_per_shard=" << c.operations_per_shard
+              << (c.ops_rate ? ", ops_rate=" + std::to_string(c.ops_rate) + "/s" : "")
               << (c.username.empty() ? "" : ", auth")
               << (c.connection_per_request ? ", connection_per_request" : "")
               << (c.connection_rate ? ", connection_rate=" + std::to_string(c.connection_rate) + (c.connection_rate_per_shard ? "/shard" : "(total)") : "")
@@ -305,9 +307,33 @@ static future<> read_one(raw_cql_connection& c, uint64_t seq) {
     co_await c.query_simple(fmt::format("SELECT * FROM ks.cf WHERE pk=0x{}", key));
 }
 
+static thread_local bool tl_rate_initialized = false; // added for ops limiter
+static thread_local seastar::lowres_clock::time_point tl_next_op_time; // next allowed op time
+static thread_local seastar::lowres_clock::duration tl_op_period; // inter-op period
+static thread_local seastar::semaphore tl_rate_sem(1); // guard scheduling
+
 // Perform one logical operation (write or read) using an existing connection.
 static future<> do_request(raw_cql_connection& c, const raw_cql_test_config& cfg) {
     auto seq = tests::random::get_int<uint64_t>(cfg.partitions - 1);
+    if (cfg.ops_rate) {
+        double per_shard_rate = double(cfg.ops_rate) / double(std::max(1u, seastar::smp::count));
+        if (per_shard_rate < 1e-9) per_shard_rate = 1e-9;
+        auto desired_period = std::chrono::duration_cast<seastar::lowres_clock::duration>(std::chrono::duration<double>(1.0 / per_shard_rate));
+        if (desired_period <= desired_period.zero()) desired_period = seastar::lowres_clock::duration(1);
+        co_await tl_rate_sem.wait();
+        if (!tl_rate_initialized) {
+            tl_op_period = desired_period;
+            tl_next_op_time = seastar::lowres_clock::now();
+            tl_rate_initialized = true;
+        }
+        auto due = tl_next_op_time;
+        tl_next_op_time += tl_op_period;
+        tl_rate_sem.signal();
+        auto now = seastar::lowres_clock::now();
+        if (due > now) {
+            co_await seastar::sleep(due - now);
+        }
+    }
     if (cfg.workload == "write") {
         co_await write_one(c, seq);
     } else {
@@ -728,7 +754,8 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
             ("connection-per-request", bpo::value<bool>()->default_value(false), "create a fresh connection for every request")
             ("connection-rate", bpo::value<unsigned>()->default_value(0), "additional AUTH (connect+startup) handshakes per second (total unless --connection-rate-per-shard)")
             ("connection-rate-per-shard", bpo::value<bool>()->default_value(false), "interpret --connection-rate as per shard instead of total")
-            ("connection-on-all-shards", bpo::value<bool>()->default_value(false), "run background connection driver on all shards (default: shard 0 only)");
+            ("connection-on-all-shards", bpo::value<bool>()->default_value(false), "run background connection driver on all shards (default: shard 0 only)")
+            ("ops-rate", bpo::value<unsigned>()->default_value(0), "limit total logical operations per second across all shards (0=unlimited)");
         bpo::variables_map vm;
         bpo::store(bpo::command_line_parser(ac,av).options(opts_desc).allow_unregistered().run(), vm);
 
@@ -745,6 +772,7 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
         c.connection_rate = vm["connection-rate"].as<unsigned>();
         c.connection_rate_per_shard = vm["connection-rate-per-shard"].as<bool>();
         c.connection_on_all_shards = vm["connection-on-all-shards"].as<bool>();
+        c.ops_rate = vm["ops-rate"].as<unsigned>();
 
         if (!c.username.empty() && c.password.empty()) {
             std::cerr << "--username specified without --password" << std::endl;
