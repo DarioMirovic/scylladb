@@ -57,6 +57,7 @@ struct raw_cql_test_config {
     unsigned concurrency; // connections per shard
     bool continue_after_error;
     uint16_t port = 9042; // native transport port
+    uint16_t auth_port = 0; // optional override port for background AUTH/connect driver (0 => use port)
     std::string username; // optional auth username
     std::string password; // optional auth password
     std::string remote_host = "127.0.0.1"; // target host for CQL + REST (empty => in-process server mode)
@@ -78,6 +79,7 @@ std::ostream& operator<<(std::ostream& os, const raw_cql_test_config& c) {
               << (c.connection_per_request ? ", connection_per_request" : "")
               << (c.connection_rate ? ", connection_rate=" + std::to_string(c.connection_rate) + (c.connection_rate_per_shard ? "/shard" : "(total)") : "")
               << (c.connection_on_all_shards && c.connection_rate ? ", conn_all_shards" : "")
+              << ((c.auth_port && c.auth_port != c.port && c.connection_rate) ? ", auth_port=" + std::to_string(c.auth_port) : "")
               << "}";
 }
 
@@ -452,6 +454,7 @@ static std::ostream& operator<<(std::ostream& os, const aggregated_conn_stats& s
     } else {
         os << "        (no successful AUTH samples)\n";
     }
+    os << "failures=" << s.failures << "\n";
     os << "auth_connections:\n";
     os << "        throughput=" << std::fixed << std::setprecision(2) << s.throughput << " conn/s";
     return os;
@@ -485,7 +488,8 @@ static void start_connection_drivers(const raw_cql_test_config& cfg, seastar::ab
             while (!abort.abort_requested() && lowres_clock::now() < deadline) {
                 ++tl_conn_stats.attempts;
                 try {
-                    auto cs = co_await connect(socket_address{net::inet_address{cfg.remote_host}, cfg.port});
+                    auto port = cfg.auth_port ? cfg.auth_port : cfg.port;
+                    auto cs = co_await connect(socket_address{net::inet_address{cfg.remote_host}, port});
                     raw_cql_connection c(std::move(cs), sstring(cfg.username), sstring(cfg.password));
                     auto auth_start = lowres_clock::now();
                     co_await c.startup();
@@ -500,7 +504,6 @@ static void start_connection_drivers(const raw_cql_test_config& cfg, seastar::ab
                     tl_conn_stats.total_latency_us_sq += (uint128_t)dur_us * (uint128_t)dur_us;
                     tl_conn_stats.auth_hist.add(dur_us);
                 } catch (...) {
-                    ++tl_conn_stats.failures;
                     if (!cfg.continue_after_error) {
                         static thread_local unsigned err_printed = 0;
                         if (err_printed < 5) {
@@ -515,6 +518,8 @@ static void start_connection_drivers(const raw_cql_test_config& cfg, seastar::ab
                     co_await sleep(next_due - now);
                 } else {
                     next_due = now;
+                    // Count how many times we fell behind schedule (could not keep up with target rate).
+                    ++tl_conn_stats.failures;
                 }
             }
         }));
@@ -755,6 +760,7 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
             ("connection-rate", bpo::value<unsigned>()->default_value(0), "additional AUTH (connect+startup) handshakes per second (total unless --connection-rate-per-shard)")
             ("connection-rate-per-shard", bpo::value<bool>()->default_value(false), "interpret --connection-rate as per shard instead of total")
             ("connection-on-all-shards", bpo::value<bool>()->default_value(false), "run background connection driver on all shards (default: shard 0 only)")
+            ("auth-port", bpo::value<uint16_t>()->default_value(0), "override port used only for background AUTH/connect driver (e.g. 19042 for shard-aware). 0 = use main port")
             ("ops-rate", bpo::value<unsigned>()->default_value(0), "limit total logical operations per second across all shards (0=unlimited)");
         bpo::variables_map vm;
         bpo::store(bpo::command_line_parser(ac,av).options(opts_desc).allow_unregistered().run(), vm);
@@ -772,6 +778,7 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
         c.connection_rate = vm["connection-rate"].as<unsigned>();
         c.connection_rate_per_shard = vm["connection-rate-per-shard"].as<bool>();
         c.connection_on_all_shards = vm["connection-on-all-shards"].as<bool>();
+        c.auth_port = vm["auth-port"].as<uint16_t>();
         c.ops_rate = vm["ops-rate"].as<unsigned>();
 
         if (!c.username.empty() && c.password.empty()) {
