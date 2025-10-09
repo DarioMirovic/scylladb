@@ -27,6 +27,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <optional>
 
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string.hpp>
@@ -62,10 +63,9 @@ struct raw_cql_test_config {
     std::string password; // optional auth password
     std::string remote_host = "127.0.0.1"; // target host for CQL + REST (empty => in-process server mode)
     bool connection_per_request = false; // create and tear down a connection for every request
-    unsigned connection_rate = 0; // target number of extra AUTH (connect+startup) handshakes per second (total or per shard)
-    bool connection_rate_per_shard = false; // interpret connection_rate as per shard if true
-    bool connection_on_all_shards = false; // run connection driver on all shards instead of shard 0 only
-    unsigned ops_rate = 0; // total logical operations per second limit (0 = unlimited)
+    std::optional<unsigned> connection_rate; // absent => unlimited, present 0 => disabled, present >0 => limited
+    unsigned connection_concurrency = 10; // concurrent connections for background AUTH driver
+    std::optional<unsigned> ops_rate; // absent => unlimited, present 0 => disabled, present >0 => limited
 };
 
 std::ostream& operator<<(std::ostream& os, const raw_cql_test_config& c) {
@@ -74,12 +74,12 @@ std::ostream& operator<<(std::ostream& os, const raw_cql_test_config& c) {
               << ", concurrency=" << c.concurrency
               << ", duration=" << c.duration_in_seconds
               << ", ops_per_shard=" << c.operations_per_shard
-              << (c.ops_rate ? ", ops_rate=" + std::to_string(c.ops_rate) + "/s" : "")
+              << (c.ops_rate ? (*c.ops_rate ? ", ops_rate=" + std::to_string(*c.ops_rate) + "/s" : ", ops_rate=0(disabled)") : "")
               << (c.username.empty() ? "" : ", auth")
               << (c.connection_per_request ? ", connection_per_request" : "")
-              << (c.connection_rate ? ", connection_rate=" + std::to_string(c.connection_rate) + (c.connection_rate_per_shard ? "/shard" : "(total)") : "")
-              << (c.connection_on_all_shards && c.connection_rate ? ", conn_all_shards" : "")
-              << ((c.auth_port && c.auth_port != c.port && c.connection_rate) ? ", auth_port=" + std::to_string(c.auth_port) : "")
+              << (c.connection_rate ? (*c.connection_rate ? ", connection_rate=" + std::to_string(*c.connection_rate) : ", connection_rate=0(disabled)") : "")
+              << (c.connection_concurrency ? ", connection_concurrency=" + std::to_string(c.connection_concurrency) : "")
+              << ((c.auth_port && c.auth_port != c.port && c.connection_rate && *c.connection_rate) ? ", auth_port=" + std::to_string(c.auth_port) : "")
               << "}";
 }
 
@@ -314,16 +314,25 @@ static thread_local seastar::lowres_clock::time_point tl_next_op_time; // next a
 static thread_local seastar::lowres_clock::duration tl_op_period; // inter-op period
 static thread_local seastar::semaphore tl_rate_sem(1); // guard scheduling
 
+static thread_local bool tl_conn_rate_initialized = false; // added for conn limiter
+static thread_local seastar::lowres_clock::time_point tl_next_conn_time; // next
+static thread_local seastar::lowres_clock::duration tl_conn_period; // inter-conn period
+static thread_local seastar::semaphore tl_conn_rate_sem(1); // guard scheduling
+
 // Perform one logical operation (write or read) using an existing connection.
 static future<> do_request(raw_cql_connection& c, const raw_cql_test_config& cfg) {
     auto seq = tests::random::get_int<uint64_t>(cfg.partitions - 1);
     if (cfg.ops_rate) {
-        double per_shard_rate = double(cfg.ops_rate) / double(std::max(1u, seastar::smp::count));
-        if (per_shard_rate < 1e-9) per_shard_rate = 1e-9;
-        auto desired_period = std::chrono::duration_cast<seastar::lowres_clock::duration>(std::chrono::duration<double>(1.0 / per_shard_rate));
-        if (desired_period <= desired_period.zero()) desired_period = seastar::lowres_clock::duration(1);
+        if (*cfg.ops_rate == 0) {
+            co_return; // disabled
+        }
         co_await tl_rate_sem.wait();
         if (!tl_rate_initialized) {
+            double per_shard_rate = double(*cfg.ops_rate) / double(std::max(1u, seastar::smp::count));
+            auto desired_period = std::chrono::duration_cast<seastar::lowres_clock::duration>(std::chrono::duration<double>(1.0 / per_shard_rate));
+            if (desired_period <= desired_period.zero()) {
+                desired_period = seastar::lowres_clock::duration(1);
+            }
             tl_op_period = desired_period;
             tl_next_op_time = seastar::lowres_clock::now();
             tl_rate_initialized = true;
@@ -410,212 +419,38 @@ static thread_local std::vector<std::unique_ptr<raw_cql_connection>> tl_conns;
 static thread_local bool tl_initialized = false;
 static thread_local semaphore tl_init_sem(1);
 
-// Connection driver per-shard stats (for supplemental AUTH/connect workload)
-struct shard_conn_stats {
-    uint64_t attempts = 0;
-    uint64_t successes = 0;
-    uint64_t failures = 0;
-    uint64_t min_latency_us = std::numeric_limits<uint64_t>::max();
-    uint64_t max_latency_us = 0;
-    uint64_t total_latency_us = 0;      // sum of latencies in microseconds
-    uint128_t total_latency_us_sq = 0;   // sum of squares for stddev (us^2)
-    utils::estimated_histogram auth_hist{160}; // store latency samples (microseconds) for percentile estimation
-};
-static thread_local shard_conn_stats tl_conn_stats; // only updated on shards running the driver
-
-// Aggregate (cross-shard) connection stats including derived metrics
-struct aggregated_conn_stats {
-    uint64_t attempts = 0;
-    uint64_t successes = 0;
-    uint64_t failures = 0;
-    double throughput = 0.0; // successes per second
-    double avg_startup_latency_us = 0.0; // average startup() latency in microseconds
-    double median_startup_latency_us = 0.0; // median
-    double p99_startup_latency_us = 0.0;
-    double min_startup_latency_us = std::numeric_limits<double>::max();
-    double max_startup_latency_us = 0.0;
-    utils::estimated_histogram auth_hist{160};
-    double stddev_startup_latency_us = 0.0; // population stddev
-    double mad_startup_latency_us = 0.0;    // median absolute deviation
-    uint128_t total_latency_us_sum = 0;    // for mean/stddev
-    uint128_t total_latency_us_sq_sum = 0; // for stddev
-};
-
-static std::ostream& operator<<(std::ostream& os, const aggregated_conn_stats& s) {
-    os << "auth_startup_latency:\n";
-    if (s.successes) {
-        os << "        mean="   << std::setw(10) << std::fixed << std::setprecision(3) << s.avg_startup_latency_us
-           << " standard-deviation=" << std::setw(10) << std::fixed << std::setprecision(3) << s.stddev_startup_latency_us << "\n";
-        os << "        median=" << std::setw(10) << std::fixed << std::setprecision(3) << s.median_startup_latency_us
-           << " median-absolute-deviation=" << std::setw(10) << std::fixed << std::setprecision(3) << s.mad_startup_latency_us << "\n";
-        os << "        p99="    << std::setw(10) << std::fixed << std::setprecision(3) << s.p99_startup_latency_us << "\n";
-        os << "        min="    << std::setw(10) << std::fixed << std::setprecision(3) << (s.min_startup_latency_us == std::numeric_limits<double>::max() ? 0.0 : s.min_startup_latency_us) << "\n";
-        os << "        max="    << std::setw(10) << std::fixed << std::setprecision(3) << s.max_startup_latency_us << "\n";
-    } else {
-        os << "        (no successful AUTH samples)\n";
-    }
-    os << "failures=" << s.failures << "\n";
-    os << "auth_connections:\n";
-    os << "        throughput=" << std::fixed << std::setprecision(2) << s.throughput << " conn/s";
-    return os;
-}
-
-// Start background connection/auth drivers based on config. Populates 'futs' with the running tasks.
-static void start_connection_drivers(const raw_cql_test_config& cfg, seastar::abort_source& abort, std::vector<future<>>& futs) {
-    if (!cfg.connection_rate) {
-        return; // disabled
-    }
-    unsigned shards_participating = cfg.connection_on_all_shards ? smp::count : 1u;
-    double per_shard_rate;
-    if (cfg.connection_rate_per_shard) {
-        per_shard_rate = cfg.connection_rate; // each shard does full rate
-    } else {
-        per_shard_rate = cfg.connection_on_all_shards ? (double(cfg.connection_rate) / double(shards_participating)) : double(cfg.connection_rate);
-    }
-    if (per_shard_rate <= 0.0) {
-        std::cout << "Computed per-shard connection rate <= 0, connection driver disabled" << std::endl;
-        return;
-    }
-    auto deadline = lowres_clock::now() + std::chrono::seconds(cfg.duration_in_seconds);
-    for (unsigned s = 0; s < shards_participating; ++s) {
-        futs.push_back(smp::submit_to(s, [cfg, &abort, per_shard_rate, deadline] () -> future<> {
-            using namespace std::chrono;
-            auto period = duration_cast<lowres_clock::duration>(duration<double>(1.0 / per_shard_rate));
-            if (period <= period.zero()) {
-                co_return;
+static future<> do_one_connection(const raw_cql_test_config& cfg) {
+    if (cfg.connection_rate) {
+        if (*cfg.connection_rate == 0) {
+            co_return; // disabled
+        }
+        co_await tl_conn_rate_sem.wait();
+        if (!tl_conn_rate_initialized) {
+            double per_shard_rate = double(*cfg.connection_rate) / double(std::max(1u, seastar::smp::count));
+            auto desired_period = std::chrono::duration_cast<seastar::lowres_clock::duration>(std::chrono::duration<double>(1.0 / per_shard_rate));
+            if (desired_period <= desired_period.zero()) {
+                desired_period = seastar::lowres_clock::duration(1);
             }
-            auto next_due = lowres_clock::now();
-            while (!abort.abort_requested() && lowres_clock::now() < deadline) {
-                ++tl_conn_stats.attempts;
-                try {
-                    auto port = cfg.auth_port ? cfg.auth_port : cfg.port;
-                    auto cs = co_await connect(socket_address{net::inet_address{cfg.remote_host}, port});
-                    raw_cql_connection c(std::move(cs), sstring(cfg.username), sstring(cfg.password));
-                    auto auth_start = lowres_clock::now();
-                    co_await c.startup();
-                    auto auth_end = lowres_clock::now();
-                    ++tl_conn_stats.successes;
-                    // Measure latency in microseconds (primary unit for stats/histogram)
-                    auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(auth_end - auth_start).count();
-                    if (dur_us <= 0) { dur_us = 1; }
-                    tl_conn_stats.min_latency_us = std::min(tl_conn_stats.min_latency_us, (uint64_t)dur_us);
-                    tl_conn_stats.max_latency_us = std::max(tl_conn_stats.max_latency_us, (uint64_t)dur_us);
-                    tl_conn_stats.total_latency_us += dur_us;
-                    tl_conn_stats.total_latency_us_sq += (uint128_t)dur_us * (uint128_t)dur_us;
-                    tl_conn_stats.auth_hist.add(dur_us);
-                } catch (...) {
-                    if (!cfg.continue_after_error) {
-                        static thread_local unsigned err_printed = 0;
-                        if (err_printed < 5) {
-                            ++err_printed;
-                            std::cerr << "Connection driver error: " << std::current_exception() << std::endl;
-                        }
-                    }
-                }
-                next_due += period;
-                auto now = lowres_clock::now();
-                if (next_due > now) {
-                    co_await sleep(next_due - now);
-                } else {
-                    next_due = now;
-                    // Count how many times we fell behind schedule (could not keep up with target rate).
-                    ++tl_conn_stats.failures;
-                }
-            }
-        }));
+            tl_conn_period = desired_period;
+            tl_next_conn_time = seastar::lowres_clock::now();
+            tl_conn_rate_initialized = true;
+        }
+        auto due = tl_next_conn_time;
+        tl_next_conn_time += tl_conn_period;
+        tl_conn_rate_sem.signal();
+        auto now = seastar::lowres_clock::now();
+        if (due > now) {
+            co_await seastar::sleep(due - now);
+        }
     }
-    std::cout << "Started connection driver: total_rate=" << cfg.connection_rate
-              << (cfg.connection_rate_per_shard ? " (per-shard)" : " (total)")
-              << ", per_shard_rate=" << per_shard_rate
-              << ", shards=" << shards_participating << std::endl;
-}
-
-static void stop_connection_drivers(seastar::abort_source& abort, std::vector<future<>>& futs) {
-    abort.request_abort();
-    if (futs.empty()) {
-        return;
-    }
+    auto port = cfg.auth_port ? cfg.auth_port : cfg.port;
     try {
-        when_all(futs.begin(), futs.end()).get();
-    } catch (...) {}
-}
-
-// Approximate median absolute deviation from histogram and precomputed median.
-static double approximate_mad_us(const utils::estimated_histogram& h, double median_us) {
-    struct bucket_dev { double d; int64_t c; };
-    std::vector<bucket_dev> devs; devs.reserve(h.bucket_offsets.size());
-    int64_t total = 0;
-    for (size_t i = 0; i < h.bucket_offsets.size(); ++i) {
-        auto c = h.buckets[i];
-        if (!c) continue;
-        double lower = (i == 0) ? 1.0 : double(h.bucket_offsets[i-1]) + 1.0;
-        double upper = double(h.bucket_offsets[i]);
-        double rep = (lower + upper) * 0.5; // midpoint of bucket
-        devs.push_back({ std::fabs(rep - median_us), c });
-        total += c;
+        auto cs = co_await connect(socket_address{net::inet_address{cfg.remote_host}, port});
+        raw_cql_connection c(std::move(cs), sstring(cfg.username), sstring(cfg.password));
+        co_await c.startup();
+    } catch (...) {
+        // Do nothing
     }
-    if (!total) return 0.0;
-    std::sort(devs.begin(), devs.end(), [](const bucket_dev& a, const bucket_dev& b){ return a.d < b.d; });
-    int64_t threshold = (total + 1) / 2;
-    int64_t acc = 0;
-    for (auto& b : devs) {
-        acc += b.c;
-        if (acc >= threshold) {
-            return b.d;
-        }
-    }
-    return devs.back().d;
-}
-
-// Convert a 128-bit unsigned integer to long double precisely (within IEEE 80-bit precision)
-static inline long double u128_to_long_double(uint128_t v) {
-    const long double two64 = 18446744073709551616.0L; // 2^64
-    uint64_t lo = (uint64_t)v;
-    uint64_t hi = (uint64_t)(v >> 64);
-    return (long double)hi * two64 + (long double)lo;
-}
-
-static aggregated_conn_stats aggregate_connection_stats(const raw_cql_test_config& cfg) {
-    aggregated_conn_stats agg;
-    for (unsigned s = 0; s < smp::count; ++s) {
-        auto shard_stats = smp::submit_to(s, [] {
-            return make_ready_future<shard_conn_stats>(tl_conn_stats);
-        }).get();
-        agg.attempts += shard_stats.attempts;
-        agg.successes += shard_stats.successes;
-        agg.failures += shard_stats.failures;
-        agg.total_latency_us_sum += shard_stats.total_latency_us;
-        agg.total_latency_us_sq_sum += shard_stats.total_latency_us_sq;
-        if (shard_stats.min_latency_us != std::numeric_limits<uint64_t>::max()) {
-            agg.min_startup_latency_us = std::min(agg.min_startup_latency_us, double(shard_stats.min_latency_us));
-        }
-        agg.max_startup_latency_us = std::max(agg.max_startup_latency_us, double(shard_stats.max_latency_us));
-        agg.auth_hist.merge(shard_stats.auth_hist);
-    }
-    double duration = cfg.duration_in_seconds ? cfg.duration_in_seconds : 1.0;
-    agg.throughput = duration ? double(agg.successes) / duration : 0.0;
-    if (agg.successes) {
-        long double n = (long double)agg.successes;
-        long double sum = u128_to_long_double(agg.total_latency_us_sum);
-        long double sum_sq = u128_to_long_double(agg.total_latency_us_sq_sum);
-        long double mean = sum / n;
-        agg.avg_startup_latency_us = (double)mean;
-        long double numerator = sum_sq - (sum * sum) / n; // sum of squared deviations
-        if (numerator < 0) numerator = 0; // numerical guard
-        long double variance = (n > 1) ? (numerator / (n - 1)) : 0; // sample variance
-        agg.stddev_startup_latency_us = std::sqrt((double)variance);
-    }
-    if (agg.min_startup_latency_us == std::numeric_limits<double>::max()) {
-        agg.min_startup_latency_us = 0.0;
-    }
-    if (agg.auth_hist.count()) {
-        auto p99_us = agg.auth_hist.percentile(0.99);
-        agg.p99_startup_latency_us = double(p99_us);
-        auto p50_us = agg.auth_hist.percentile(0.50);
-        agg.median_startup_latency_us = double(p50_us);
-        agg.mad_startup_latency_us = approximate_mad_us(agg.auth_hist, agg.median_startup_latency_us);
-    }
-    return agg;
 }
 
 static future<> prepare_thread_connections(const raw_cql_test_config cfg) {
@@ -700,8 +535,11 @@ static void workload_main(raw_cql_test_config cfg) {
         std::cerr << "Compaction wait failed: " << std::current_exception() << std::endl;
         throw;
     }
-    if (cfg.connection_rate && cfg.connection_per_request) {
+    if (cfg.connection_rate && *cfg.connection_rate > 0 && cfg.connection_per_request) {
         throw std::runtime_error("--connection-rate is not compatible with --connection-per-request (every request already connects)");
+    }
+    if (!cfg.connection_concurrency) {
+        throw std::runtime_error("connection_concurrency must be > 0");
     }
     if (!cfg.connection_per_request) {
         // Warm up: establish all per-thread connections before measurement.
@@ -718,27 +556,36 @@ static void workload_main(raw_cql_test_config cfg) {
         ensure_schema(*tl_conns[0]).get();
     }
 
-    seastar::abort_source conn_abort;
-    std::vector<future<>> conn_driver_futs;
-    if (cfg.connection_rate) {
-        start_connection_drivers(cfg, conn_abort, conn_driver_futs);
+    seastar::future<std::vector<perf_result>> ops_f = seastar::make_ready_future<std::vector<perf_result>>();
+    if (!(cfg.ops_rate && *cfg.ops_rate == 0)) { // run ops unless explicitly disabled
+        ops_f = seastar::async([cfg] {
+            return time_parallel([cfg] () -> future<> {
+                if (cfg.connection_per_request) {
+                    co_await run_one_with_new_connection(cfg);
+                } else {
+                    static thread_local size_t idx = 0;
+                    auto& c = *tl_conns[idx++ % tl_conns.size()];
+                    co_await do_request(c, cfg);
+                }
+            }, cfg.concurrency, cfg.duration_in_seconds, cfg.operations_per_shard, !cfg.continue_after_error);
+        });
     }
 
-    auto results = time_parallel([cfg] () -> future<> {
-        if (cfg.connection_per_request) {
-            co_await run_one_with_new_connection(cfg);
-        } else {
-            static thread_local size_t idx = 0;
-            auto& c = *tl_conns[idx++ % tl_conns.size()];
-            co_await do_request(c, cfg);
-        }
-    }, cfg.concurrency, cfg.duration_in_seconds, cfg.operations_per_shard, !cfg.continue_after_error);
-    std::cout << aggregated_perf_results(results) << std::endl;
+    seastar::future<std::vector<perf_result>> conn_f = seastar::make_ready_future<std::vector<perf_result>>();
+    if (!(cfg.connection_rate && *cfg.connection_rate == 0)) { // run conn driver unless explicitly disabled
+        conn_f = seastar::async([cfg] {
+            return time_parallel([cfg] () -> future<> {
+                co_await do_one_connection(cfg);
+            }, cfg.connection_concurrency, cfg.duration_in_seconds, 0, !cfg.continue_after_error);
+        });
+    }
 
-    if (cfg.connection_rate) {
-        stop_connection_drivers(conn_abort, conn_driver_futs);
-        auto stats = aggregate_connection_stats(cfg);
-        std::cout << stats << std::endl;
+    auto [ops_results, conn_results] = seastar::when_all_succeed(std::move(ops_f), std::move(conn_f)).get();
+    if (!(cfg.ops_rate && *cfg.ops_rate == 0)) {
+        std::cout << "Ops results: " << std::endl << aggregated_perf_results(ops_results) << std::endl;
+    }
+    if (!(cfg.connection_rate && *cfg.connection_rate == 0)) {
+        std::cout << "Conn results: " << std::endl << aggregated_perf_results(conn_results) << std::endl;
     }
 }
 
@@ -757,11 +604,10 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
             ("password", bpo::value<std::string>()->default_value(""), "authentication password")
             ("remote-host", bpo::value<std::string>()->default_value(""), "remote host to connect to, leave empty to run in-process server")
             ("connection-per-request", bpo::value<bool>()->default_value(false), "create a fresh connection for every request")
-            ("connection-rate", bpo::value<unsigned>()->default_value(0), "additional AUTH (connect+startup) handshakes per second (total unless --connection-rate-per-shard)")
-            ("connection-rate-per-shard", bpo::value<bool>()->default_value(false), "interpret --connection-rate as per shard instead of total")
-            ("connection-on-all-shards", bpo::value<bool>()->default_value(false), "run background connection driver on all shards (default: shard 0 only)")
+            ("connection-rate", bpo::value<unsigned>()->default_value(0), "connections per second: omit for unlimited; 0=disable; >0=rate limit")
+            ("connection-concurrency", bpo::value<unsigned>()->default_value(1), "concurrent connections for background AUTH driver")
             ("auth-port", bpo::value<uint16_t>()->default_value(0), "override port used only for background AUTH/connect driver (e.g. 19042 for shard-aware). 0 = use main port")
-            ("ops-rate", bpo::value<unsigned>()->default_value(0), "limit total logical operations per second across all shards (0=unlimited)");
+            ("ops-rate", bpo::value<unsigned>()->default_value(0), "ops per second: omit for unlimited; 0=disable; >0=rate limit");
         bpo::variables_map vm;
         bpo::store(bpo::command_line_parser(ac,av).options(opts_desc).allow_unregistered().run(), vm);
 
@@ -775,11 +621,24 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
         c.password = vm["password"].as<std::string>();
         c.remote_host = vm["remote-host"].as<std::string>();
         c.connection_per_request = vm["connection-per-request"].as<bool>();
-        c.connection_rate = vm["connection-rate"].as<unsigned>();
-        c.connection_rate_per_shard = vm["connection-rate-per-shard"].as<bool>();
-        c.connection_on_all_shards = vm["connection-on-all-shards"].as<bool>();
+        {
+            auto& vv = vm["connection-rate"]; // always present due to default_value
+            if (vv.defaulted()) {
+                c.connection_rate = std::nullopt; // unlimited
+            } else {
+                c.connection_rate = vv.as<unsigned>(); // includes 0=disabled, >0 limited
+            }
+        }
+        c.connection_concurrency = vm["connection-concurrency"].as<unsigned>();
         c.auth_port = vm["auth-port"].as<uint16_t>();
-        c.ops_rate = vm["ops-rate"].as<unsigned>();
+        {
+            auto& vv = vm["ops-rate"]; // always present
+            if (vv.defaulted()) {
+                c.ops_rate = std::nullopt; // unlimited
+            } else {
+                c.ops_rate = vv.as<unsigned>();
+            }
+        }
 
         if (!c.username.empty() && c.password.empty()) {
             std::cerr << "--username specified without --password" << std::endl;
@@ -787,6 +646,10 @@ std::function<int(int, char**)> cql_raw(std::function<int(int, char**)> scylla_m
         }
         if (c.workload != "read" && c.workload != "write") {
             std::cerr << "Unknown workload: " << c.workload << "\n"; return 1;
+        }
+        if (c.ops_rate && *c.ops_rate == 0 && c.connection_rate && *c.connection_rate == 0) {
+            std::cout << "Both ops and connection workloads disabled (ops-rate=0, connection-rate=0); nothing to do." << std::endl;
+            return 0;
         }
 
         // Remove test options to not disturb scylla main app
