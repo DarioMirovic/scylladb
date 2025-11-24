@@ -213,7 +213,9 @@ future<> standard_role_manager::legacy_create_default_role_if_missing() {
 }
 
 future<> standard_role_manager::maybe_create_default_role() {
-    SCYLLA_ASSERT(_superuser);
+    if (!_superuser) {
+        co_return;
+    }
     auto has_superuser = [this] () -> future<bool> {
         const sstring query = seastar::format("SELECT * FROM {}.{} WHERE is_superuser = true ALLOW FILTERING", get_auth_ks_name(_qp), meta::roles_table::name);
         auto results = co_await _qp.execute_internal(query, db::consistency_level::LOCAL_ONE,
