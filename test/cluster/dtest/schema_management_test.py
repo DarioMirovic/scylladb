@@ -8,6 +8,7 @@
 import functools
 import logging
 import string
+import threading
 import time
 from concurrent import futures
 from typing import NamedTuple
@@ -449,29 +450,37 @@ class TestLargePartitionAlterSchema(Tester):
         """
         )
 
-    def populate(self, session, data, ck_start, ck_end):
+    def populate(self, session, data, ck_start, ck_end, stop_populating: threading.Event = None):
+        def _populate_loop():
+            for pk in range(self.PARTITIONS):
+                for ck in range(ck_rows[0], ck_rows[1]):
+                    if stop_populating is not None and stop_populating.is_set():
+                        return
+                    row = [pk, ck, self.STRING_VALUE, self.STRING_VALUE]
+                    data.append(row)
+                    yield tuple(row)
+
         logger.debug(f"Start populate DB: {self.PARTITIONS} partitions with {ck_end - ck_start} records in each partition")
 
         ck_rows = [ck_start, ck_end]
+        parameters = _populate_loop()
 
         stmt = session.prepare("INSERT INTO lp_table (pk, ck1, val1, val2) VALUES (?, ?, ?, ?)")
 
-        for pk in range(self.PARTITIONS):
-            for ck in range(ck_rows[0], ck_rows[1]):
-                data.append([pk, ck, self.STRING_VALUE, self.STRING_VALUE])
-
-        execute_concurrent_with_args(session=session, statement=stmt, parameters=data)
+        execute_concurrent_with_args(session=session, statement=stmt, parameters=parameters, concurrency=100)
         logger.debug(f"Finish populate DB: {self.PARTITIONS} partitions with {ck_end - ck_start} records in each partition")
         return data
 
-    def read(self, session, ck_max):
-        logger.debug(f"Start reading..")
-
-        for _ in range(2):
+    def read(self, session, ck_max, stop_reading: threading.Event = None):
+        def _read_loop():
             for pk in range(self.PARTITIONS):
                 for ck in range(ck_max):
+                    if stop_reading is not None and stop_reading.is_set():
+                        return
                     session.execute(f"select * from lp_table where pk = {pk} and ck1 = {ck}")
 
+        logger.debug(f"Start reading..")
+        _read_loop()
         logger.debug(f"Finish reading..")
 
     def add_column(self, session, column_name, column_type):
@@ -488,10 +497,17 @@ class TestLargePartitionAlterSchema(Tester):
         data = self.populate(session=session, data=[], ck_start=0, ck_end=10)
 
         threads = []
+        timeout = 300
+        ck_end = 5000
+        if isinstance(self.cluster, ScyllaCluster) and self.cluster.scylla_mode == "debug":
+            timeout = 900
+            ck_end = 500
         with ThreadPoolExecutor(max_workers=5) as executor:
+            stop_populating = threading.Event()
+            stop_reading = threading.Event()
             # Insert new rows in background
-            threads.append(executor.submit(self.populate, session=session, data=data, ck_start=10, ck_end=1500))
-            threads.append(executor.submit(self.read, session=session, ck_max=1500))
+            threads.append(executor.submit(self.populate, session=session, data=data, ck_start=10, ck_end=ck_end, stop_populating=stop_populating))
+            threads.append(executor.submit(self.read, session=session, ck_max=ck_end, stop_reading=stop_reading))
             # Wait for running load
             time.sleep(10)
             self.add_column(session, "new_clmn", "int")
@@ -500,7 +516,13 @@ class TestLargePartitionAlterSchema(Tester):
             logger.debug("Flush data")
             self.cluster.nodelist()[0].flush()
 
-            for future in futures.as_completed(threads, timeout=300):
+            # Stop populating and reading soon after flush
+            time.sleep(1)
+            logger.debug("Stop populating and reading")
+            stop_populating.set()
+            stop_reading.set()
+
+            for future in futures.as_completed(threads, timeout=timeout):
                 try:
                     future.result()
                 except Exception as exc:  # noqa: BLE001
@@ -518,14 +540,16 @@ class TestLargePartitionAlterSchema(Tester):
 
         threads = []
         timeout = 300
-        ck_end = 1500
+        ck_end = 5000
         if isinstance(self.cluster, ScyllaCluster) and self.cluster.scylla_mode == "debug":
             timeout = 900
-            ck_end = 150
+            ck_end = 500
         with ThreadPoolExecutor(max_workers=5) as executor:
+            stop_populating = threading.Event()
+            stop_reading = threading.Event()
             # Insert new rows in background
-            threads.append(executor.submit(self.populate, session=session, data=data, ck_start=10, ck_end=ck_end))
-            threads.append(executor.submit(self.read, session=session, ck_max=ck_end))
+            threads.append(executor.submit(self.populate, session=session, data=data, ck_start=10, ck_end=ck_end, stop_populating=stop_populating))
+            threads.append(executor.submit(self.read, session=session, ck_max=ck_end, stop_reading=stop_reading))
             # Wait for running load
             time.sleep(10)
             self.drop_column(session=session, column_name="val1")
@@ -533,6 +557,12 @@ class TestLargePartitionAlterSchema(Tester):
             # Memtable flush has to happen after a schema alter concurrently with a read
             logger.debug("Flush data")
             self.cluster.nodelist()[0].flush()
+
+            # Stop populating and reading soon after flush
+            time.sleep(1)
+            logger.debug("Stop populating and reading")
+            stop_populating.set()
+            stop_reading.set()
 
             result = []
             for future in futures.as_completed(threads, timeout=timeout):
