@@ -126,7 +126,10 @@ class AuditTester:
                 # Server stays up — only push live-updatable keys.
                 live_cfg = {k: v for k, v in needed.items() if k in LIVE_AUDIT_KEYS}
                 live_cfg["enable_create_table_with_compact_storage"] = enable_compact_storage
+                log_file = await self.manager.server_open_log(srv.server_id)
+                mark = await log_file.mark()
                 await self.manager.server_update_config(srv.server_id, config_options=live_cfg)
+                await log_file.wait_for("completed re-reading configuration file", from_mark=mark, timeout=60)
 
     async def _start_fresh_servers(self, needed: dict[str, str],
                                    enable_compact_storage: bool,
@@ -219,7 +222,6 @@ class AuditTester:
         audit_mode = needed.get("audit") or ""
         if "table" not in audit_mode:
             cql.execute("DROP KEYSPACE IF EXISTS audit")
-        helper.clear_audit_logs(cql)
 
         return server_ips
 
@@ -248,6 +250,7 @@ class AuditTester:
         session.execute("DROP KEYSPACE IF EXISTS ks")
         if create_keyspace:
             create_ks(session, "ks", rf)
+        self.helper.clear_audit_logs(session)
         return session
 
 
@@ -407,6 +410,7 @@ class AuditBackendSyslog(AuditBackend):
 
     @override
     def clear_audit_logs(self, session: Session | None = None) -> None:
+        self.unix_socket_listener.get_lines()
         self.unix_socket_listener.lines.clear()
 
     def update_audit_settings(self, audit_settings, modifiers=None):
