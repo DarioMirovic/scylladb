@@ -9,14 +9,13 @@
 # collections/tuples/UDTs of literals) only in the WHERE clause. This test suite
 # tests literals in the SELECT clause, which were added later [1].
 #
-# The simplest example, "SELECT 1" actually doesn't work since its type cannot
-# be inferred (is it a tinyint, int, or bigint?), so we use UDFs and other functions
-# that accept known types instead. We do test that "SELECT 1" and similar fail
-# in the expected way due to type inference failure.
+# Scalar literals (integers, strings, floats, etc.) and tuples work with
+# inferred types. Maps, lists, and bind markers require explicit type context.
 #
 # [1]: https://scylladb.atlassian.net/browse/SCYLLADB-296
 
 from contextlib import contextmanager
+import uuid
 import pytest
 from .util import unique_name, new_function
 from .conftest import scylla_only
@@ -63,18 +62,34 @@ def test_set_literal_selector(cql, test_keyspace, scylla_only):
     rows = cql.execute(f"SELECT set_intersection(vals2, {{ {{ 'cc': 3, 'dd': 4 }}, {{ 'cc': 3, 'dd': 5 }} }}) AS intersection FROM {test_keyspace}.sets WHERE id=1")
     assert rows.one().intersection == {frozenset([('cc', 3), ('dd', 4)])}
 
-# Test that simple literals without type hints fail as expected due to type inference failure.
-def test_simple_literal_type_inference_failure(cql, test_keyspace):
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT 1 AS one FROM system.local")
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT 'hello' AS greeting FROM system.local")
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT [1, 2, 3] AS lst FROM system.local")
+# Test that scalars and tuples work with inferred types in SELECT.
+def test_inferred_type_literal_selectors(cql, test_keyspace):
+    rows = cql.execute("SELECT 1 AS v FROM system.local")
+    assert rows.one().v == 1
+    rows = cql.execute("SELECT 1.5 AS v FROM system.local")
+    assert rows.one().v == 1.5
+    rows = cql.execute("SELECT 'hello' AS v FROM system.local")
+    assert rows.one().v == 'hello'
+    rows = cql.execute("SELECT true AS v FROM system.local")
+    assert rows.one().v == True
+    rows = cql.execute("SELECT 123e4567-e89b-12d3-a456-426614174000 AS v FROM system.local")
+    assert rows.one().v == uuid.UUID('123e4567-e89b-12d3-a456-426614174000')
+    rows = cql.execute("SELECT 0xdeadbeef AS v FROM system.local")
+    assert rows.one().v == bytes.fromhex('deadbeef')
+    rows = cql.execute("SELECT 1mo AS v FROM system.local")
+    assert rows.one().v is not None
+    # Tuple element types are inferred individually.
+    rows = cql.execute("SELECT (1, 'a', 3.0) AS tpl FROM system.local")
+    assert rows.one().tpl == (1, 'a', 3.0)
+
+# Test that literals which cannot have their type inferred fail as expected.
+def test_literal_type_inference_failure(cql, test_keyspace):
+    # Maps and lists require explicit element type context.
     with pytest.raises(InvalidRequest, match="infer type"):
         cql.execute("SELECT { 'a': 1, 'b': 2 } AS mp FROM system.local")
     with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT (1, 'a', 3.0) AS tpl FROM system.local")
+        cql.execute("SELECT [1, 2, 3] AS lst FROM system.local")
+    # Bind markers have no type info at all.
     with pytest.raises(InvalidRequest, match="infer type"):
         cql.execute("SELECT ? AS qm FROM system.local")
     with pytest.raises(InvalidRequest, match="infer type"):

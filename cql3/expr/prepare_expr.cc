@@ -803,8 +803,23 @@ std::optional<expression>
 untyped_constant_prepare_expression(const untyped_constant& uc, data_dictionary::database db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver)
 {
     if (!receiver) {
-        // TODO: It is possible to infer the type of a constant by looking at the value and selecting the smallest fit
-        return std::nullopt;
+        data_type inferred_type;
+        switch (uc.partial_type) {
+            case untyped_constant::type_class::integer:       inferred_type = int32_type;   break;
+            case untyped_constant::type_class::floating_point: inferred_type = double_type; break;
+            case untyped_constant::type_class::string:        inferred_type = utf8_type;    break;
+            case untyped_constant::type_class::boolean:       inferred_type = boolean_type; break;
+            case untyped_constant::type_class::duration:      inferred_type = duration_type; break;
+            case untyped_constant::type_class::uuid:          inferred_type = uuid_type;    break;
+            case untyped_constant::type_class::hex:           inferred_type = bytes_type;   break;
+            case untyped_constant::type_class::null:
+                return std::nullopt;
+        }
+        try {
+            return constant(cql3::raw_value::make_value(untyped_constant_parsed_value(uc, inferred_type)), inferred_type);
+        } catch (const marshal_exception& e) {
+            throw exceptions::invalid_request_exception(e.what());
+        }
     }
     if (!is_assignable(untyped_constant_test_assignment(uc, db, keyspace, *receiver))) {
       if (uc.partial_type != untyped_constant::type_class::null) {
@@ -1040,6 +1055,10 @@ prepare_function_args_for_type_inference(std::span<const expression> args, data_
     // Prepared expressions have a known type, which helps with finding the right function.
     std::vector<shared_ptr<assignment_testable>> partially_prepared_args;
     for (const expression& argument : args) {
+        if (expr::is<expr::untyped_constant>(argument)) {
+            partially_prepared_args.emplace_back(as_assignment_testable(argument, std::nullopt));
+            continue;
+        }
         std::optional<expression> prepared_arg_opt = try_prepare_expression(argument, db, keyspace, schema_opt, nullptr);
         auto type = prepared_arg_opt ? std::optional(type_of(*prepared_arg_opt)) : std::nullopt;
         auto expr = prepared_arg_opt ? std::move(*prepared_arg_opt) : argument;
