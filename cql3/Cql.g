@@ -402,21 +402,21 @@ selectStatement returns [std::unique_ptr<raw::parsed_statement> expr]
                 cf=columnFamilyName
                 | K_MUTATION_FRAGMENTS '(' cf=columnFamilyName ')' { statement_subtype = raw::select_statement::parameters::statement_subtype::MUTATION_FRAGMENTS; }
         )
-      ( K_WHERE w=whereClause { wclause = std::move(w); } )?
-      ( K_GROUP K_BY gbcolumns=listOfIdentifiers)?
-      ( K_ORDER K_BY orderByClause[orderings, is_ann_ordering] ( ',' orderByClause[orderings, is_ann_ordering] )* )?
-      ( K_PER K_PARTITION K_LIMIT rows=intValue { per_partition_limit = std::move(rows); } )?
-      ( K_LIMIT rows=intValue { limit = std::move(rows); } )?
-      ( K_ALLOW K_FILTERING  { allow_filtering = true; } )?
-      ( K_BYPASS K_CACHE { bypass_cache = true; })?
-      ( usingTimeoutServiceLevelClause[attrs] )?
+        ( K_WHERE w=whereClause { wclause = std::move(w); } )?
+        ( K_GROUP K_BY gbcolumns=listOfIdentifiers)?
+        ( K_ORDER K_BY orderByClause[orderings, is_ann_ordering] ( ',' orderByClause[orderings, is_ann_ordering] )* )?
+        ( K_PER K_PARTITION K_LIMIT rows=intValue { per_partition_limit = std::move(rows); } )?
+        ( K_LIMIT rows=intValue { limit = std::move(rows); } )?
+        ( K_ALLOW K_FILTERING  { allow_filtering = true; } )?
+        ( K_BYPASS K_CACHE { bypass_cache = true; })?
+        ( usingTimeoutServiceLevelClause[attrs] )?
       )?
       {
           if (has_from) {
-          auto params = make_lw_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering, statement_subtype, bypass_cache);
-          $expr = std::make_unique<raw::select_statement>(std::move(cf), std::move(params),
-            std::move(sclause), std::move(wclause), std::move(limit), std::move(per_partition_limit),
-            std::move(gbcolumns), std::move(attrs));
+            auto params = make_lw_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering, statement_subtype, bypass_cache);
+            $expr = std::make_unique<raw::select_statement>(std::move(cf), std::move(params),
+              std::move(sclause), std::move(wclause), std::move(limit), std::move(per_partition_limit),
+              std::move(gbcolumns), std::move(attrs));
           } else {
               $expr = std::make_unique<raw::select_no_from_statement>(std::move(sclause));
           }
