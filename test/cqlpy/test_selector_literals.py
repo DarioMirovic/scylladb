@@ -82,6 +82,26 @@ def test_inferred_type_literal_selectors(cql, test_keyspace):
     rows = cql.execute("SELECT (1, 'a', 3.0) AS tpl FROM system.local")
     assert rows.one().tpl == (1, 'a', 3.0)
 
+# Test SELECT without a FROM clause. Cassandra does not support this syntax,
+# so these tests are Scylla-only.
+def test_select_without_from(cql, test_keyspace, scylla_only):
+    rows = cql.execute("SELECT 1 AS one")
+    assert rows.one().one == 1
+    rows = cql.execute("SELECT 'hello' AS greeting")
+    assert rows.one().greeting == 'hello'
+    rows = cql.execute("SELECT now() AS t")
+    assert rows.one().t is not None
+    rows = cql.execute("SELECT toTimestamp(now()) AS ts")
+    assert rows.one().ts is not None
+    rows = cql.execute("SELECT 1 AS one, 'hi' AS greeting")
+    row = rows.one()
+    assert row.one == 1
+    assert row.greeting == 'hi'
+    with pytest.raises(InvalidRequest, match="FROM"):
+        cql.execute("SELECT *")
+    with pytest.raises(InvalidRequest, match="resolve column"):
+        cql.execute("SELECT col")
+
 # Test that literals which cannot have their type inferred fail as expected.
 def test_literal_type_inference_failure(cql, test_keyspace):
     # Maps and lists require explicit element type context.
