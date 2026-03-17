@@ -8,9 +8,10 @@
 
 """exec_cql.py
 Execute CQL statements from a file where each non-empty, non-comment line is exactly one CQL statement.
+Connects via a Unix domain socket (maintenance socket), bypassing authentication.
 Requires python cassandra-driver. Stops at first failure.
 Usage:
-  ./exec_cql.py --file ./conf/auth.cql [--host 127.0.0.1 --port 9042]
+  ./exec_cql.py --file ./conf/auth.cql --socket /path/to/cql.m
 """
 import argparse, os, sys
 from typing import Sequence
@@ -26,18 +27,27 @@ def read_statements(path: str) -> list[tuple[int, str]]:
                 stms.append((lineno, line))
     return stms
 
-def exec_driver(statements: list[tuple[int, str]], host: str, port: int, timeout: float, username: str, password: str) -> int:
+def exec_statements(statements: list[tuple[int, str]], socket_path: str, timeout: float) -> int:
+    """Execute CQL statements via a Unix domain socket (maintenance socket).
+
+    The maintenance socket only starts listening after the auth subsystem is
+    fully initialised, so a successful connect means the node is ready.
+    """
+    from cassandra.cluster import Cluster
+    from cassandra.connection import UnixSocketEndPoint  # type: ignore
+    from cassandra.policies import WhiteListRoundRobinPolicy  # type: ignore
+
+    ep = UnixSocketEndPoint(socket_path)
     try:
-        from cassandra.cluster import Cluster
-        from cassandra.auth import PlainTextAuthProvider  # type: ignore
-    except Exception:
-        print('ERROR: cassandra-driver not installed. Install with: pip install cassandra-driver', file=sys.stderr)
+        cluster = Cluster(
+            contact_points=[ep],
+            load_balancing_policy=WhiteListRoundRobinPolicy([ep]),
+        )
+        session = cluster.connect()
+    except Exception as e:
+        print(f'ERROR: failed to connect to maintenance socket {socket_path}: {e}', file=sys.stderr)
         return 2
-    auth_provider = None
-    if username != "":
-        auth_provider = PlainTextAuthProvider(username=username, password=password)
-    cluster = Cluster([host], port=port, auth_provider=auth_provider)
-    session = cluster.connect()
+
     try:
         for _, (lineno, s) in enumerate(statements, 1):
             try:
@@ -50,13 +60,11 @@ def exec_driver(statements: list[tuple[int, str]], host: str, port: int, timeout
     return 0
 
 def main(argv: Sequence[str]) -> int:
-    ap = argparse.ArgumentParser(description='Execute one-line CQL statements from file (driver only)')
+    ap = argparse.ArgumentParser(description='Execute one-line CQL statements from file via maintenance socket')
     ap.add_argument('--file', required=True)
-    ap.add_argument('--host', default='127.0.0.1')
-    ap.add_argument('--port', type=int, default=9042)
+    ap.add_argument('--socket', required=True,
+                    help='Path to the Unix domain maintenance socket (<workdir>/cql.m)')
     ap.add_argument('--timeout', type=float, default=30.0)
-    ap.add_argument('--username', default='cassandra')
-    ap.add_argument('--password', default='cassandra')
     args = ap.parse_args(argv)
     if not os.path.isfile(args.file):
         print(f"File not found: {args.file}", file=sys.stderr)
@@ -65,7 +73,7 @@ def main(argv: Sequence[str]) -> int:
     if not stmts:
         print('No statements found', file=sys.stderr)
         return 1
-    rc = exec_driver(stmts, args.host, args.port, args.timeout, args.username, args.password)
+    rc = exec_statements(stmts, args.socket, args.timeout)
     if rc == 0:
         print('All statements executed successfully')
     return rc

@@ -452,6 +452,28 @@ async def merge_profraw(directory: PathLike) -> None:
     if glob.glob(f"{directory}/*.profraw"):
         await bash(fr"llvm-profdata merge {q(directory)}/*.profraw -output {q(directory)}/prof.profdata")
 
+def maintenance_socket_path(cluster_workdir: PathLike, addr: str) -> str:
+    """Returns the absolute path of the maintenance socket for a given node.
+
+    With ``maintenance_socket: workdir`` in scylla.yaml the socket lives at
+    ``<node-workdir>/cql.m``, i.e. ``<cluster_workdir>/<addr>/cql.m``.
+    """
+    return os.path.realpath(f"{cluster_workdir}/{addr}/cql.m")
+
+async def setup_cassandra_user(workdir: PathLike, addr: str) -> None:
+    """Create the ``cassandra`` superuser via the maintenance socket.
+
+    The default cassandra superuser is no longer seeded automatically, but
+    ``cassandra-stress`` hardcodes ``user=cassandra password=cassandra``.
+    We create the role over the maintenance socket so that cassandra-stress
+    and other tools that rely on the default credentials keep working.
+    """
+    socket = maintenance_socket_path(workdir, addr)
+    stmt = "CREATE ROLE cassandra WITH PASSWORD = 'cassandra' AND SUPERUSER = true AND LOGIN = true;"
+    f = q(socket)
+    # Write the statement to a temp file and execute it via exec_cql.py.
+    await bash(fr"""tmpf=$(mktemp); echo {q(stmt)} > "$tmpf"; python3 ./exec_cql.py --file "$tmpf" --socket {f}; rc=$?; rm -f "$tmpf"; exit $rc""")
+
 async def get_bolt_opts(executable: PathLike) -> list[str]:
     """Returns the extra opts which have to be passed to a BOLT-instrumented Scylla
     to trigger a generation of a BOLT profile file.
@@ -557,8 +579,10 @@ def kw(**kwargs):
 
 @contextlib.asynccontextmanager
 async def with_cs_populate(executable: PathLike, workdir: PathLike) -> AsyncIterator[str]:
-    """Provides a Scylla cluster and waits for compactions to end before stopping it."""
+    """Provides a Scylla cluster, creates the cassandra superuser, and waits
+    for compactions to end before stopping it."""
     async with with_cluster(executable=executable, workdir=workdir) as (addrs, procs):
+        await setup_cassandra_user(workdir, addrs[0])
         yield addrs[0]
         async with asyncio.timeout(3600):
             # Should it also flush memtables?
@@ -667,9 +691,10 @@ populators["decommission_dataset"] = populate_decommission
 # AUTH CONNECTIONS STRESS ==================================================
 
 async def populate_auth_conns(executable: PathLike, workdir: PathLike) -> None:
-    # Create roles, table and permissions via CQL script.
+    # Create roles, table and permissions via CQL script over the maintenance socket.
     async with with_cs_populate(executable=executable, workdir=workdir) as server:
-        await bash(fr"python3 ./exec_cql.py --file conf/auth.cql --host {server}")
+        socket = maintenance_socket_path(workdir, server)
+        await bash(fr"python3 ./exec_cql.py --file conf/auth.cql --socket {q(socket)}")
 
 async def train_auth_conns(executable: PathLike, workdir: PathLike) -> None:
     # Repeatedly connect as the reader user and perform simple reads to stress
@@ -722,7 +747,8 @@ populators["si_dataset"] = populate_si
 
 async def populate_counters(executable: PathLike, workdir: PathLike) -> None:
     async with with_cs_populate(executable=executable, workdir=workdir) as server:
-        await bash(fr"python3 ./exec_cql.py --file conf/counters.cql --host {server}")
+        socket = maintenance_socket_path(workdir, server)
+        await bash(fr"python3 ./exec_cql.py --file conf/counters.cql --socket {q(socket)}")
         # Sleeps added in reaction to schema disagreement errors.
         # FIXME: get rid of this sleep and find a sane way to wait for schema
         # agreement.
