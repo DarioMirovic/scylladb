@@ -799,11 +799,39 @@ untyped_constant_test_assignment(const untyped_constant& uc, data_dictionary::da
 }
 
 static
+std::optional<data_type>
+infer_default_type(const untyped_constant& uc) {
+    switch (uc.partial_type) {
+        case untyped_constant::type_class::string:          return utf8_type;
+        case untyped_constant::type_class::boolean:         return boolean_type;
+        case untyped_constant::type_class::floating_point:  return double_type;
+        case untyped_constant::type_class::duration:        return duration_type;
+        case untyped_constant::type_class::uuid:            return uuid_type;
+        case untyped_constant::type_class::hex:             return bytes_type;
+        case untyped_constant::type_class::null:            return std::nullopt;
+        case untyped_constant::type_class::integer:
+            // Select the smallest of int, bigint, or varint that fits the value.
+            // tinyint and smallint are never inferred — use CAST to obtain them.
+            // from_string throws marshal_exception if the value overflows,
+            // so we try each type in order of increasing range.
+            try {
+                int32_type->from_string(uc.raw_text);
+                return int32_type;
+            } catch (const marshal_exception&) {}
+            try {
+                long_type->from_string(uc.raw_text);
+                return long_type;
+            } catch (const marshal_exception&) {}
+            return varint_type;
+    }
+    __builtin_unreachable();
+}
+
+static
 std::optional<expression>
 untyped_constant_prepare_expression(const untyped_constant& uc, data_dictionary::database db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver)
 {
     if (!receiver) {
-        // TODO: It is possible to infer the type of a constant by looking at the value and selecting the smallest fit
         return std::nullopt;
     }
     if (!is_assignable(untyped_constant_test_assignment(uc, db, keyspace, *receiver))) {
@@ -939,23 +967,20 @@ sql_cast_prepare_expression(const cast& c, data_dictionary::database db, const s
             keyspace, "unknown_cf", ::make_shared<column_identifier>(receiver_name, true), cast_type);
     }
 
-    auto prepared_arg = try_prepare_expression(c.arg, db, keyspace, schema_opt, nullptr);
-    if (!prepared_arg) {
-        throw exceptions::invalid_request_exception(fmt::format("Could not infer type of cast argument {}", c.arg));
-    }
+    auto prepared_arg = prepare_expression(c.arg, db, keyspace, schema_opt, nullptr);
 
     // cast to the same type should be omitted
-    if (cast_type == type_of(*prepared_arg)) {
+    if (cast_type == type_of(prepared_arg)) {
         return prepared_arg;
     }
 
     // This will throw if a cast is impossible
-    auto fun = functions::get_castas_fctn_as_cql3_function(cast_type, type_of(*prepared_arg));
+    auto fun = functions::get_castas_fctn_as_cql3_function(cast_type, type_of(prepared_arg));
 
     // We implement the cast to a function_call.
     return function_call{
         .func = std::move(fun),
-        .args = std::vector({*prepared_arg}),
+        .args = std::vector({std::move(prepared_arg)}),
     };
 }
 
@@ -1031,6 +1056,152 @@ field_selection_test_assignment(const field_selection& fs, data_dictionary::data
     }
     auto field_type = ut->type(*idx);
     return expression_test_assignment(field_type, receiver);
+}
+
+// Lightweight assignment_testable wrapper around a data_type.
+// Used by infer_type to feed inferred types into functions::get() for overload
+// resolution without producing prepared expressions.
+class assignment_testable_type : public assignment_testable {
+    data_type _type;
+public:
+    explicit assignment_testable_type(data_type type) : _type(std::move(type)) {}
+    test_result test_assignment(data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) const override {
+        return expression_test_assignment(_type, receiver);
+    }
+    vector_test_result test_assignment_any_size_float_vector() const override {
+        return {test_result::NOT_ASSIGNABLE, std::nullopt};
+    }
+    sstring assignment_testable_source_context() const override {
+        return _type->as_cql3_type().to_string();
+    }
+    std::optional<data_type> assignment_testable_type_opt() const override {
+        return _type;
+    }
+};
+
+static
+lw_shared_ptr<column_specification>
+make_inferred_receiver(data_type type) {
+    return make_lw_shared<column_specification>(
+        "", "",
+        ::make_shared<column_identifier>("<inferred>", true),
+        std::move(type));
+}
+
+static
+std::optional<data_type>
+infer_type(const expression& e, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt) {
+    return expr::visit(overloaded_functor{
+        [&] (const untyped_constant& uc) -> std::optional<data_type> {
+            return infer_default_type(uc);
+        },
+        [&] (const collection_constructor& cc) -> std::optional<data_type> {
+            if (cc.elements.empty()) {
+                return std::nullopt;
+            }
+            switch (cc.style) {
+            case collection_constructor::style_type::list_or_vector: {
+                auto first_type = infer_type(cc.elements[0], db, keyspace, schema_opt);
+                if (!first_type) {
+                    return std::nullopt;
+                }
+                for (size_t i = 1; i < cc.elements.size(); ++i) {
+                    auto t = infer_type(cc.elements[i], db, keyspace, schema_opt);
+                    if (!t || *t != *first_type) {
+                        return std::nullopt;
+                    }
+                }
+                return list_type_impl::get_instance(*first_type, false);
+            }
+            case collection_constructor::style_type::set: {
+                auto first_type = infer_type(cc.elements[0], db, keyspace, schema_opt);
+                if (!first_type) {
+                    return std::nullopt;
+                }
+                for (size_t i = 1; i < cc.elements.size(); ++i) {
+                    auto t = infer_type(cc.elements[i], db, keyspace, schema_opt);
+                    if (!t || *t != *first_type) {
+                        return std::nullopt;
+                    }
+                }
+                return set_type_impl::get_instance(*first_type, false);
+            }
+            case collection_constructor::style_type::map: {
+                auto& first_entry = expr::as<tuple_constructor>(cc.elements[0]);
+                auto first_key_type = infer_type(first_entry.elements[0], db, keyspace, schema_opt);
+                auto first_value_type = infer_type(first_entry.elements[1], db, keyspace, schema_opt);
+                if (!first_key_type || !first_value_type) {
+                    return std::nullopt;
+                }
+                for (size_t i = 1; i < cc.elements.size(); ++i) {
+                    auto& entry = expr::as<tuple_constructor>(cc.elements[i]);
+                    auto kt = infer_type(entry.elements[0], db, keyspace, schema_opt);
+                    auto vt = infer_type(entry.elements[1], db, keyspace, schema_opt);
+                    if (!kt || *kt != *first_key_type || !vt || *vt != *first_value_type) {
+                        return std::nullopt;
+                    }
+                }
+                return map_type_impl::get_instance(*first_key_type, *first_value_type, false);
+            }
+            case collection_constructor::style_type::vector:
+                return std::nullopt;
+            }
+            return std::nullopt;
+        },
+        [&] (const tuple_constructor& tc) -> std::optional<data_type> {
+            std::vector<data_type> element_types;
+            element_types.reserve(tc.elements.size());
+            for (auto& elem : tc.elements) {
+                auto t = infer_type(elem, db, keyspace, schema_opt);
+                if (!t) {
+                    return std::nullopt;
+                }
+                element_types.push_back(std::move(*t));
+            }
+            return tuple_type_impl::get_instance(std::move(element_types));
+        },
+        [&] (const cast& c) -> std::optional<data_type> {
+            try {
+                return cast_get_prepared_type(c, db, keyspace);
+            } catch (...) {
+                return std::nullopt;
+            }
+        },
+        [&] (const function_call& fc) -> std::optional<data_type> {
+            return std::visit(overloaded_functor{
+                [&] (const functions::function_name& name) -> std::optional<data_type> {
+                    std::vector<shared_ptr<assignment_testable>> testable_args;
+                    testable_args.reserve(fc.args.size());
+                    for (auto& arg : fc.args) {
+                        auto arg_type = infer_type(arg, db, keyspace, schema_opt);
+                        if (!arg_type) {
+                            return std::nullopt;
+                        }
+                        testable_args.push_back(::make_shared<assignment_testable_type>(std::move(*arg_type)));
+                    }
+                    std::optional<std::string_view> cf_name;
+                    if (schema_opt) {
+                        cf_name = std::string_view(schema_opt->cf_name());
+                    }
+                    try {
+                        auto fun = functions::instance().get(db, keyspace, name, testable_args, keyspace, cf_name, nullptr);
+                        if (!fun) {
+                            return std::nullopt;
+                        }
+                        return fun->return_type();
+                    } catch (...) {
+                        return std::nullopt;
+                    }
+                },
+                [&] (const shared_ptr<functions::function>& func) -> std::optional<data_type> {
+                    return func->return_type();
+                },
+            }, fc.func);
+        },
+        [&] (const auto&) -> std::optional<data_type> {
+            return std::nullopt;
+        },
+    }, e);
 }
 
 static
@@ -1617,10 +1788,17 @@ test_assignment_any_size_float_vector(const expression& expr) {
 expression
 prepare_expression(const expression& expr, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, lw_shared_ptr<column_specification> receiver) {
     auto e_opt = try_prepare_expression(expr, db, keyspace, schema_opt, std::move(receiver));
-    if (!e_opt) {
-        throw exceptions::invalid_request_exception(fmt::format("Could not infer type of {}", expr));
+    if (e_opt) {
+        return std::move(*e_opt);
     }
-    return std::move(*e_opt);
+    auto inferred = infer_type(expr, db, keyspace, schema_opt);
+    if (inferred) {
+        e_opt = try_prepare_expression(expr, db, keyspace, schema_opt, make_inferred_receiver(std::move(*inferred)));
+        if (e_opt) {
+            return std::move(*e_opt);
+        }
+    }
+    throw exceptions::invalid_request_exception(fmt::format("Could not infer type of {}", expr));
 }
 
 assignment_testable::test_result

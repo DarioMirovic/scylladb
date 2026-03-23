@@ -63,18 +63,14 @@ def test_set_literal_selector(cql, test_keyspace, scylla_only):
     rows = cql.execute(f"SELECT set_intersection(vals2, {{ {{ 'cc': 3, 'dd': 4 }}, {{ 'cc': 3, 'dd': 5 }} }}) AS intersection FROM {test_keyspace}.sets WHERE id=1")
     assert rows.one().intersection == {frozenset([('cc', 3), ('dd', 4)])}
 
-# Test that simple literals without type hints fail as expected due to type inference failure.
-def test_simple_literal_type_inference_failure(cql, test_keyspace):
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT 1 AS one FROM system.local")
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT 'hello' AS greeting FROM system.local")
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT [1, 2, 3] AS lst FROM system.local")
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT { 'a': 1, 'b': 2 } AS mp FROM system.local")
-    with pytest.raises(InvalidRequest, match="infer type"):
-        cql.execute("SELECT (1, 'a', 3.0) AS tpl FROM system.local")
+# Test that simple literals without type hints succeed with type inference,
+# and bind variables fail because they cannot self-type.
+def test_simple_literal_type_inference(cql, test_keyspace, scylla_only):
+    assert cql.execute("SELECT 1 AS one FROM system.local").one().one == 1
+    assert cql.execute("SELECT 'hello' AS greeting FROM system.local").one().greeting == 'hello'
+    assert cql.execute("SELECT [1, 2, 3] AS lst FROM system.local").one().lst == [1, 2, 3]
+    assert cql.execute("SELECT { 'a': 1, 'b': 2 } AS mp FROM system.local").one().mp == {'a': 1, 'b': 2}
+    assert cql.execute("SELECT (1, 'a', 3.0) AS tpl FROM system.local").one().tpl == (1, 'a', 3.0)
     with pytest.raises(InvalidRequest, match="infer type"):
         cql.execute("SELECT ? AS qm FROM system.local")
     with pytest.raises(InvalidRequest, match="infer type"):
@@ -89,3 +85,6 @@ def test_count_literal_only_1(cql, test_keyspace, scylla_only):
     # here is quite a hassle and we plan to relax the restriction later anyway.
     with pytest.raises(InvalidRequest, match="only valid when argument types are known"):
         cql.execute("SELECT count(?) AS cnt FROM system.local")
+    with pytest.raises(InvalidRequest, match="only valid when argument types are known"):
+        stmt = cql.prepare("SELECT count(:bindvar) AS cnt FROM system.local")
+        cql.execute(stmt, {'bindvar': 1})
