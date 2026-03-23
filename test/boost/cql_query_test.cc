@@ -6185,4 +6185,153 @@ SEASTAR_TEST_CASE(test_sstable_load_mixed_generation_type) {
     });
 }
 
+SEASTAR_TEST_CASE(test_select_constant_type_inference) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        // Integer constant — small value fits int32
+        auto msg = e.execute_cql("SELECT 1 FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({int32_type})
+            .with_row({{int32_type->decompose(1)}});
+
+        // Integer constant — large value requires bigint
+        msg = e.execute_cql("SELECT 10000000000 FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({long_type})
+            .with_row({{long_type->decompose(int64_t(10000000000))}});
+
+        // String constant
+        msg = e.execute_cql("SELECT 'hello' FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({utf8_type})
+            .with_row({{utf8_type->decompose(sstring("hello"))}});
+
+        // Boolean constant
+        msg = e.execute_cql("SELECT true FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({boolean_type})
+            .with_row({{boolean_type->decompose(true)}});
+
+        // Floating-point constant
+        msg = e.execute_cql("SELECT 3.14 FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({double_type});
+
+        // Multiple constants
+        msg = e.execute_cql("SELECT 1, 'hello', true FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({int32_type, utf8_type, boolean_type});
+
+        // Function call without receiver
+        msg = e.execute_cql("SELECT now() FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1);
+
+        // count(1) works
+        msg = e.execute_cql("SELECT count(1) FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1);
+    });
+}
+
+SEASTAR_TEST_CASE(test_select_collection_literal_type_inference) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        // List literal
+        auto msg = e.execute_cql("SELECT [1, 2, 3] FROM system.local").get();
+        auto expected_list_type = list_type_impl::get_instance(int32_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_list_type});
+
+        // Set literal
+        msg = e.execute_cql("SELECT {1, 2, 3} FROM system.local").get();
+        auto expected_set_type = set_type_impl::get_instance(int32_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_set_type});
+
+        // Map literal
+        msg = e.execute_cql("SELECT {'a': 1, 'b': 2} FROM system.local").get();
+        auto expected_map_type = map_type_impl::get_instance(utf8_type, int32_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_map_type});
+
+        // Nested collection literal
+        msg = e.execute_cql("SELECT [[1, 2], [3, 4]] FROM system.local").get();
+        auto expected_nested_list = list_type_impl::get_instance(
+                list_type_impl::get_instance(int32_type, false), false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_nested_list});
+
+        // Different element types in collection should fail (strict matching)
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [1, 10000000000] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [1, 3.14] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // Mixed types in collection should fail
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [1, 'hello'] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {1, 'hello'} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {'a': 1, 'b': 'hello'} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {'a': 1, 2: 3} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [1, true] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // Nested collection type mismatch
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [[1, 2], [3, 'a']] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // Empty collection should fail (can't infer type)
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // Null without context should fail
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT null FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // Function calls inside collections — infer_type resolves return types
+        // via functions::get() without producing prepared expressions
+        msg = e.execute_cql("SELECT [now(), now()] FROM system.local").get();
+        auto expected_timeuuid_list = list_type_impl::get_instance(timeuuid_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_timeuuid_list});
+
+        // Tuple literal
+        msg = e.execute_cql("SELECT (1, 'hello', true) FROM system.local").get();
+        auto expected_tuple_type = tuple_type_impl::get_instance({int32_type, utf8_type, boolean_type});
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_tuple_type});
+
+        // SQL CAST in SELECT clause
+        msg = e.execute_cql("SELECT CAST(1 AS bigint) FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({long_type})
+            .with_row({{long_type->decompose(int64_t(1))}});
+    });
+}
+
 BOOST_AUTO_TEST_SUITE_END()
