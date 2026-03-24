@@ -76,14 +76,15 @@ def test_simple_literal_type_inference(cql, test_keyspace):
     with pytest.raises(InvalidRequest, match="infer type"):
         cql.execute("SELECT :bindvar AS bv FROM system.local")
 
-# Test that count(2) fails as expected. We're likely to relax this restriction later
-# as it is quite artificial. scylla_only because Cassandra does allow it.
-def test_count_literal_only_1(cql, test_keyspace, scylla_only):
-    with pytest.raises(InvalidRequest, match="expects a column or the literal 1 as an argument"):
-        cql.execute("SELECT count(2) AS cnt FROM system.local")
-    # Error message here is not the best, but tightening error messages
-    # here is quite a hassle and we plan to relax the restriction later anyway.
-    with pytest.raises(InvalidRequest, match="only valid when argument types are known"):
+# Test that count with a literal argument works with types that can be inferred,
+# and fails when the argument is a bind variable (which cannot self-type).
+def test_count_literal_args(cql, test_keyspace, scylla_only):
+    cql.execute("SELECT count(*) AS cnt FROM system.local")
+    cql.execute("SELECT count(0) AS cnt FROM system.local")
+    cql.execute("SELECT count(1) AS cnt FROM system.local")
+    cql.execute("SELECT count(2) AS cnt FROM system.local")
+    cql.execute("SELECT count('abc') AS cnt FROM system.local")
+    with pytest.raises(InvalidRequest):
         cql.execute("SELECT count(?) AS cnt FROM system.local")
     with pytest.raises(InvalidRequest):
         cql.execute("SELECT count(:bindvar) AS cnt FROM system.local")
