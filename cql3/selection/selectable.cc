@@ -74,7 +74,7 @@ selectable_processes_selection(const expr::expression& selectable) {
             return true;
         },
         [&] (const expr::usertype_constructor&) -> bool {
-            on_internal_error(slogger, "collection_constructor found its way to selector context");
+            on_internal_error(slogger, "usertype_constructor found its way to selector context");
         },
         [&] (const expr::temporary& t) -> bool {
             // Well it doesn't process the selection, but it's not bypasses the selection completely
