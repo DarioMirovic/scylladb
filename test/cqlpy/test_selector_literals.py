@@ -18,7 +18,7 @@
 
 from contextlib import contextmanager
 import pytest
-from .util import unique_name, new_function
+from .util import unique_name, new_function, new_test_table
 from .conftest import scylla_only
 from cassandra.protocol import InvalidRequest
 
@@ -76,15 +76,27 @@ def test_simple_literal_type_inference(cql, test_keyspace, scylla_only):
     with pytest.raises(InvalidRequest, match="infer type"):
         cql.execute("SELECT :bindvar AS bv FROM system.local")
 
-# Test that count(2) fails as expected. We're likely to relax this restriction later
-# as it is quite artificial. scylla_only because Cassandra does allow it.
-def test_count_literal_only_1(cql, test_keyspace, scylla_only):
-    with pytest.raises(InvalidRequest, match="expects a column or the literal 1 as an argument"):
-        cql.execute("SELECT count(2) AS cnt FROM system.local")
-    # Error message here is not the best, but tightening error messages
-    # here is quite a hassle and we plan to relax the restriction later anyway.
+# Test that count with a literal argument works with types that can be inferred,
+# and fails when the argument is a bind variable (which cannot self-type).
+def test_count_literal_args(cql, test_keyspace, scylla_only):
+    assert cql.execute("SELECT count(*) AS cnt FROM system.local").one().cnt == 1
+    assert cql.execute("SELECT count(1) AS cnt FROM system.local").one().cnt == 1
+    assert cql.execute("SELECT count('abc') AS cnt FROM system.local").one().cnt == 1
     with pytest.raises(InvalidRequest, match="only valid when argument types are known"):
         cql.execute("SELECT count(?) AS cnt FROM system.local")
     with pytest.raises(InvalidRequest, match="only valid when argument types are known"):
         stmt = cql.prepare("SELECT count(:bindvar) AS cnt FROM system.local")
         cql.execute(stmt, {'bindvar': 1})
+
+# Test that count(fn(col)) correctly counts only non-null results.
+# The UDF returns NULL for inputs divisible by 7, so out of 14 rows
+# (values 1-14), only values 7 and 14 produce NULL, giving count = 12.
+def test_count_function_with_nulls(cql, test_keyspace, scylla_only):
+    body = "(i int) CALLED ON NULL INPUT RETURNS int LANGUAGE lua AS 'if i % 7 == 0 then return nil else return i end;'"
+    with new_function(cql, test_keyspace, body, args="int") as fn:
+        with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int") as table:
+            for i in range(1, 15):
+                cql.execute(f"INSERT INTO {table} (pk, v) VALUES ({i}, {i})")
+            ksfn = f"{test_keyspace}.{fn}"
+            row = cql.execute(f"SELECT count({ksfn}(v)) AS cnt FROM {table}").one()
+            assert row.cnt == 12
