@@ -895,13 +895,7 @@ assignment_testable::test_result
 cast_test_assignment(const cast& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) {
     try {
         data_type casted_type = cast_get_prepared_type(c, db, keyspace);
-        if (receiver.type == casted_type) {
-            return assignment_testable::test_result::EXACT_MATCH;
-        } else if (receiver.type->is_value_compatible_with(*casted_type)) {
-            return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
-        } else {
-            return assignment_testable::test_result::NOT_ASSIGNABLE;
-        }
+        return expression_test_assignment(casted_type, receiver);
     } catch (exceptions::invalid_request_exception& e) {
         throwing_assert(0 && "cast_test_assignment exception");
     }
@@ -1057,6 +1051,62 @@ field_selection_test_assignment(const field_selection& fs, data_dictionary::data
     return expression_test_assignment(field_type, receiver);
 }
 
+// Try to widen two types within the same numeric chain.
+// Returns the wider type, or nullopt if the types are not in the same
+// widening chain. Two independent lossless chains:
+//   Integer: byte < short < int32 < int64 < varint
+//   Float:   float < double
+// Cross-chain widening (e.g. int32 → double) is not supported.
+static
+std::optional<data_type>
+try_widen(const data_type& a, const data_type& b) {
+    using kind = abstract_type::kind;
+    static constexpr kind integer_chain[] = {
+        kind::byte, kind::short_kind, kind::int32, kind::long_kind, kind::varint
+    };
+    static constexpr kind float_chain[] = {
+        kind::float_kind, kind::double_kind
+    };
+    auto rank_in = [] (const kind chain[], size_t len, const data_type& t) -> std::optional<size_t> {
+        for (size_t i = 0; i < len; ++i) {
+            if (chain[i] == t->get_kind()) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    };
+    auto kind_to_type = [] (kind k) -> data_type {
+        switch (k) {
+            case kind::byte: return byte_type;
+            case kind::short_kind: return short_type;
+            case kind::int32: return int32_type;
+            case kind::long_kind: return long_type;
+            case kind::varint: return varint_type;
+            case kind::float_kind: return float_type;
+            case kind::double_kind: return double_type;
+            default: abort();
+        }
+    };
+    auto ra = rank_in(integer_chain, std::size(integer_chain), a);
+    auto rb = rank_in(integer_chain, std::size(integer_chain), b);
+    if (ra && rb) {
+        return kind_to_type(integer_chain[std::max(*ra, *rb)]);
+    }
+    ra = rank_in(float_chain, std::size(float_chain), a);
+    rb = rank_in(float_chain, std::size(float_chain), b);
+    if (ra && rb) {
+        return kind_to_type(float_chain[std::max(*ra, *rb)]);
+    }
+    return std::nullopt;
+}
+
+// Check if type `from` can be losslessly widened to type `to`.
+static
+bool is_widenable_to(const data_type& from, const data_type& to) {
+    auto widened = try_widen(from, to);
+    return widened && **widened == *to;
+}
+
 // Lightweight assignment_testable wrapper around a data_type.
 // Used by infer_type to feed inferred types into functions::get() for overload
 // resolution without producing prepared expressions.
@@ -1065,7 +1115,11 @@ class assignment_testable_type : public assignment_testable {
 public:
     explicit assignment_testable_type(data_type type) : _type(std::move(type)) {}
     test_result test_assignment(data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) const override {
-        return expression_test_assignment(_type, receiver);
+        auto result = expression_test_assignment(_type, receiver);
+        if (result == test_result::NOT_ASSIGNABLE && is_widenable_to(_type, receiver.type)) {
+            return test_result::WEAKLY_ASSIGNABLE;
+        }
+        return result;
     }
     vector_test_result test_assignment_any_size_float_vector() const override {
         return {test_result::NOT_ASSIGNABLE, std::nullopt};
@@ -1098,49 +1152,54 @@ infer_type(const expression& e, data_dictionary::database db, const sstring& key
             if (cc.elements.empty()) {
                 return std::nullopt;
             }
+            auto find_consensus = [&] (std::span<const expression> elements, auto&& project) -> std::optional<data_type> {
+                std::optional<data_type> consensus;
+                for (auto& elem : elements) {
+                    auto t = infer_type(project(elem), db, keyspace, schema_opt);
+                    if (!t) {
+                        return std::nullopt;
+                    }
+                    if (!consensus) {
+                        consensus = std::move(t);
+                    } else if (**t != **consensus) {
+                        auto widened = try_widen(*consensus, *t);
+                        if (!widened) {
+                            return std::nullopt;
+                        }
+                        consensus = std::move(widened);
+                    }
+                }
+                return consensus;
+            };
+            auto identity = [] (const expression& e) -> const expression& { return e; };
             switch (cc.style) {
             case collection_constructor::style_type::list_or_vector: {
-                auto first_type = infer_type(cc.elements[0], db, keyspace, schema_opt);
-                if (!first_type) {
+                auto elem_type = find_consensus(cc.elements, identity);
+                if (!elem_type) {
                     return std::nullopt;
                 }
-                for (size_t i = 1; i < cc.elements.size(); ++i) {
-                    auto t = infer_type(cc.elements[i], db, keyspace, schema_opt);
-                    if (!t || *t != *first_type) {
-                        return std::nullopt;
-                    }
-                }
-                return list_type_impl::get_instance(*first_type, false);
+                return list_type_impl::get_instance(*elem_type, false);
             }
             case collection_constructor::style_type::set: {
-                auto first_type = infer_type(cc.elements[0], db, keyspace, schema_opt);
-                if (!first_type) {
+                auto elem_type = find_consensus(cc.elements, identity);
+                if (!elem_type) {
                     return std::nullopt;
                 }
-                for (size_t i = 1; i < cc.elements.size(); ++i) {
-                    auto t = infer_type(cc.elements[i], db, keyspace, schema_opt);
-                    if (!t || *t != *first_type) {
-                        return std::nullopt;
-                    }
-                }
-                return set_type_impl::get_instance(*first_type, false);
+                return set_type_impl::get_instance(*elem_type, false);
             }
             case collection_constructor::style_type::map: {
-                auto& first_entry = expr::as<tuple_constructor>(cc.elements[0]);
-                auto first_key_type = infer_type(first_entry.elements[0], db, keyspace, schema_opt);
-                auto first_value_type = infer_type(first_entry.elements[1], db, keyspace, schema_opt);
-                if (!first_key_type || !first_value_type) {
+                auto key_of = [] (const expression& e) -> const expression& {
+                    return expr::as<tuple_constructor>(e).elements[0];
+                };
+                auto value_of = [] (const expression& e) -> const expression& {
+                    return expr::as<tuple_constructor>(e).elements[1];
+                };
+                auto key_type = find_consensus(cc.elements, key_of);
+                auto value_type = find_consensus(cc.elements, value_of);
+                if (!key_type || !value_type) {
                     return std::nullopt;
                 }
-                for (size_t i = 1; i < cc.elements.size(); ++i) {
-                    auto& entry = expr::as<tuple_constructor>(cc.elements[i]);
-                    auto kt = infer_type(entry.elements[0], db, keyspace, schema_opt);
-                    auto vt = infer_type(entry.elements[1], db, keyspace, schema_opt);
-                    if (!kt || *kt != *first_key_type || !vt || *vt != *first_value_type) {
-                        return std::nullopt;
-                    }
-                }
-                return map_type_impl::get_instance(*first_key_type, *first_value_type, false);
+                return map_type_impl::get_instance(*key_type, *value_type, false);
             }
             case collection_constructor::style_type::vector:
                 return std::nullopt;
@@ -1360,6 +1419,8 @@ static assignment_testable::test_result expression_test_assignment(const data_ty
     if (receiver.type->underlying_type() == expr_type->underlying_type() || (receiver.type == long_type && expr_type->is_counter())) {
         return assignment_testable::test_result::EXACT_MATCH;
     } else if (receiver.type->is_value_compatible_with(*expr_type)) {
+        return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
+    } else if (is_widenable_to(expr_type, receiver.type)) {
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
     } else {
         return assignment_testable::test_result::NOT_ASSIGNABLE;

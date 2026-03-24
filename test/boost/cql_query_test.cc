@@ -6270,12 +6270,59 @@ SEASTAR_TEST_CASE(test_select_collection_literal_type_inference) {
             .with_size(1)
             .with_column_types({expected_nested_list});
 
-        // Different element types in collection should fail (strict matching)
-        BOOST_REQUIRE_THROW(
-            e.execute_cql("SELECT [1, 10000000000] FROM system.local").get(),
-            exceptions::invalid_request_exception);
+        // Type widening within integer chain
+        msg = e.execute_cql("SELECT [1, 10000000000] FROM system.local").get();
+        auto expected_bigint_list = list_type_impl::get_instance(long_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_bigint_list});
+
+        msg = e.execute_cql("SELECT {1, 10000000000} FROM system.local").get();
+        auto expected_bigint_set = set_type_impl::get_instance(long_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_bigint_set});
+
+        msg = e.execute_cql("SELECT {'a': 1, 'b': 10000000000} FROM system.local").get();
+        auto expected_text_bigint_map = map_type_impl::get_instance(utf8_type, long_type, false);
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({expected_text_bigint_map});
+
+        // Integer widening: int32 + int64 + varint (from literal values)
+        msg = e.execute_cql("SELECT [1, 10000000000, 99999999999999999999] FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({list_type_impl::get_instance(varint_type, false)});
+
+        // Full integer widening chain with C-style type hints
+        msg = e.execute_cql("SELECT [(tinyint)1, (smallint)2, 3, 10000000000, 99999999999999999999] FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({list_type_impl::get_instance(varint_type, false)});
+
+        // Float chain: float + double → double
+        msg = e.execute_cql("SELECT [(float)1.0, 3.14] FROM system.local").get();
+        assert_that(msg).is_rows()
+            .with_size(1)
+            .with_column_types({list_type_impl::get_instance(double_type, false)});
+
+        // Cross-chain widening (int + double) should fail
         BOOST_REQUIRE_THROW(
             e.execute_cql("SELECT [1, 3.14] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {1, 3.14} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {'a': 1, 'b': 3.14} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {1: 'a', 3.14: 'b'} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        // Cross-chain: float + int
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [(float)1.0, 1] FROM system.local").get(),
             exceptions::invalid_request_exception);
 
         // Mixed types in collection should fail
@@ -6304,10 +6351,36 @@ SEASTAR_TEST_CASE(test_select_collection_literal_type_inference) {
         BOOST_REQUIRE_THROW(
             e.execute_cql("SELECT {} FROM system.local").get(),
             exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [] FROM system.local").get(),
+            exceptions::invalid_request_exception);
 
         // Null without context should fail
         BOOST_REQUIRE_THROW(
             e.execute_cql("SELECT null FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // Null cannot self-type, so collections containing null fail
+        // at type inference time ("Could not infer type of ...").
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [1, null] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {1, null} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {'a': null} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {null: 1} FROM system.local").get(),
+            exceptions::invalid_request_exception);
+
+        // All nulls in collection — no consensus possible
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT [null, null] FROM system.local").get(),
+            exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(
+            e.execute_cql("SELECT {null: null} FROM system.local").get(),
             exceptions::invalid_request_exception);
 
         // Function calls inside collections — infer_type resolves return types
