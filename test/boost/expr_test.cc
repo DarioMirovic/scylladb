@@ -2607,9 +2607,10 @@ BOOST_AUTO_TEST_CASE(prepare_constant_with_receiver) {
 
     BOOST_REQUIRE_EQUAL(int_const, prepared_int_const);
 
-    // Preparing an int32 with int64 receiver fails
-    BOOST_REQUIRE_THROW(prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(long_type)),
-                        exceptions::invalid_request_exception);
+    // Preparing an int32 with int64 receiver succeeds — int32 is widenable to int64
+    expression prepared_int_long =
+        prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(long_type));
+    BOOST_REQUIRE(expr::type_of(prepared_int_long) == long_type);
 
     // Preparing an int32 with text receiver fails
     BOOST_REQUIRE_THROW(prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(utf8_type)),
