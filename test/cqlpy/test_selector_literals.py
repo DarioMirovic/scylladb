@@ -18,9 +18,9 @@
 
 from contextlib import contextmanager
 import pytest
-from .util import unique_name, new_function
+from .util import unique_name, new_function, new_cql
 from .conftest import scylla_only
-from cassandra.protocol import InvalidRequest
+from cassandra.protocol import InvalidRequest, SyntaxException
 
 want_lua = scylla_only
 
@@ -88,3 +88,80 @@ def test_count_literal_args(cql, test_keyspace, scylla_only):
         cql.execute("SELECT count(?) AS cnt FROM system.local")
     with pytest.raises(InvalidRequest):
         cql.execute("SELECT count(:bindvar) AS cnt FROM system.local")
+
+# Test SELECT without a FROM clause. Cassandra does not support this syntax.
+def test_select_without_from(cql, scylla_only):
+    # Constants
+    assert cql.execute("SELECT 1 AS one").one().one == 1
+    assert cql.execute("SELECT 'hello' AS greeting").one().greeting == 'hello'
+    assert cql.execute("SELECT true AS b").one().b == True
+    # Function calls
+    rows = cql.execute("SELECT now() AS t")
+    assert rows.one().t is not None
+    rows = cql.execute("SELECT toTimestamp(now()) AS ts")
+    assert rows.one().ts is not None
+    # Multiple selectors
+    rows = cql.execute("SELECT 1 AS one, 'hi' AS greeting")
+    row = rows.one()
+    assert row.one == 1
+    assert row.greeting == 'hi'
+    # Collections and tuples
+    assert cql.execute("SELECT [1, 2, 3] AS lst").one().lst == [1, 2, 3]
+    assert cql.execute("SELECT {1, 2, 3} AS st").one().st == {1, 2, 3}
+    assert cql.execute("SELECT {'a': 1, 'b': 2} AS mp").one().mp == {'a': 1, 'b': 2}
+    assert cql.execute("SELECT (1, 'hello', true) AS tpl").one().tpl == (1, 'hello', True)
+    # CAST
+    assert cql.execute("SELECT CAST(1 AS bigint) AS v").one().v == 1
+    # AS aliases are optional — results can be accessed by position
+    assert cql.execute("SELECT 1")[0][0] == 1
+    assert cql.execute("SELECT 'hello', 42")[0][0] == 'hello'
+    assert cql.execute("SELECT 'hello', 42")[0][1] == 42
+    assert cql.execute("SELECT now()")[0][0] is not None
+    # Failure cases
+    with pytest.raises(InvalidRequest, match="FROM"):
+        cql.execute("SELECT *")
+    with pytest.raises(InvalidRequest):
+        cql.execute("SELECT col")
+    # Clauses that only apply to SELECT with FROM are rejected as syntax errors
+    with pytest.raises(SyntaxException):
+        cql.execute("SELECT 1 ALLOW FILTERING")
+    with pytest.raises(SyntaxException):
+        cql.execute("SELECT 1 LIMIT 5")
+    with pytest.raises(SyntaxException):
+        cql.execute("SELECT 1 WHERE x = 1")
+    with pytest.raises(SyntaxException):
+        cql.execute("SELECT 1 ORDER BY x")
+
+# Test aggregate functions in SELECT without FROM.
+# Without a FROM clause, aggregates operate over a single virtual row,
+# following the PostgreSQL/MySQL convention:
+#   count(5) -> 1, min(5) -> 5, max(5) -> 5, etc.
+def test_select_aggregates_without_from(cql, scylla_only):
+    assert cql.execute("SELECT count(1) AS cnt").one().cnt == 1
+    assert cql.execute("SELECT count(0) AS cnt").one().cnt == 1
+    assert cql.execute("SELECT count('abc') AS cnt").one().cnt == 1
+    assert cql.execute("SELECT min(5) AS v").one().v == 5
+    assert cql.execute("SELECT max(5) AS v").one().v == 5
+    assert cql.execute("SELECT min('hello') AS v").one().v == 'hello'
+    assert cql.execute("SELECT max('hello') AS v").one().v == 'hello'
+    # AS aliases are optional - results can be accessed by position
+    assert cql.execute("SELECT count(1)")[0][0] == 1
+    # Mixed aggregates and scalar expressions
+    row = cql.execute("SELECT count(1) AS cnt, 42 AS num, min(10) AS mn").one()
+    assert row.cnt == 1
+    assert row.num == 42
+    assert row.mn == 10
+
+# Test that user-defined functions can be called in SELECT without FROM,
+# both with a keyspace-qualified name and with an unqualified name
+# (resolved against the session keyspace).
+def test_udf_without_from(cql, test_keyspace, scylla_only):
+    body = "(i int) RETURNS NULL ON NULL INPUT RETURNS int LANGUAGE lua AS 'return i + 100;'"
+    with new_function(cql, test_keyspace, body) as fun:
+        # Keyspace-qualified call
+        assert cql.execute(f"SELECT {test_keyspace}.{fun}(1) AS v").one().v == 101
+        # Unqualified call (resolved against session keyspace).
+        # Use a separate connection so that USE doesn't affect other tests.
+        with new_cql(cql) as ncql:
+            ncql.execute(f"USE {test_keyspace}")
+            assert ncql.execute(f"SELECT {fun}(1) AS v").one().v == 101
