@@ -353,10 +353,18 @@ Native aggregates
 Count
 `````
 
-The ``count`` function can be used to count the rows returned by a query. Example::
+The ``COUNT`` function counts all non-null values of its argument.
+The argument can be a column, a literal, or any expression (including function calls).
+
+``COUNT(*)`` is a special form that counts all rows, regardless of null values::
 
     SELECT COUNT (*) FROM plays;
+
+Since a literal is never null, ``COUNT`` with a literal argument is equivalent to
+``COUNT(*)``::
+
     SELECT COUNT (1) FROM plays;
+    SELECT COUNT ('any') FROM plays;
 
 It also can be used to count the non-null value of a given column::
 
