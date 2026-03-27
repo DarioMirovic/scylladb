@@ -88,10 +88,27 @@ A :token:`selector` can be one of the following:
 - A literal value (constant).
 - A bind variable (`?` or `:name`).
 
-Note that due to a quirk of the type system, literals and bind markers cannot be
-used as top-level selectors, as the parser cannot infer their type. However, they can be used
-when nested inside functions, as the function formal parameter types provide the
-necessary context.
+Literals can be used as top-level selectors. Their type is inferred automatically.
+Collection and tuple literals are supported, with element types inferred recursively.
+When collection elements have different sizes within the same numeric family, they are
+widened to the largest type within two lossless chains:
+
+- Integer: ``tinyint`` < ``smallint`` < ``int`` < ``bigint`` < ``varint``
+- Floating-point: ``float`` < ``double``
+
+Cross-family widening (e.g. ``int`` and ``double``) is not supported and requires an
+explicit ``CAST``.
+
+Bind markers (``?`` and ``:name``) cannot be used as top-level selectors, as their
+type cannot be determined without context.
+
+Examples::
+
+    SELECT 1, 'hello', true FROM t;
+    SELECT [1, 2, 3] FROM t;
+    SELECT {'a': 1, 'b': 2} FROM t;
+    SELECT [1, 10000000000] FROM t;  -- frozen<list<bigint>>, widened from int + bigint
+    SELECT CAST(1 AS bigint) FROM t;
 
 Aliases
 ```````
