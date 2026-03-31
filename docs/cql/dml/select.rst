@@ -10,7 +10,7 @@ Querying data from data is done using a ``SELECT`` statement:
 .. code-block::
    
    select_statement: SELECT [ DISTINCT ] ( `select_clause` | '*' )
-                   : FROM `table_name`
+                   : [ FROM `table_name`
                    : [ WHERE `where_clause` ]
                    : [ GROUP BY `group_by_clause` ]
                    : [ ORDER BY `ordering_clause` ]
@@ -20,6 +20,7 @@ Querying data from data is done using a ``SELECT`` statement:
                    : [ ALLOW FILTERING ]
                    : [ BYPASS CACHE ]
                    : [ USING TIMEOUT `timeout` ]
+                   : ]
    select_clause: `selector` [ AS `identifier` ] ( ',' `selector` [ AS `identifier` ] )*
    selector: ( `column_name`
            : | CAST '(' `selector` AS `cql_type` ')'
@@ -55,15 +56,19 @@ For instance::
 
     SELECT * FROM users WHERE event_type = 'myEvent' USING TIMEOUT 50ms;
 
+    SELECT 1 AS one, now() AS current_time;
+
 The ``SELECT`` statement reads one or more columns for one or more rows in a table. It returns a result-set of the rows
 matching the request, where each row contains the values for the selection corresponding to the query. Additionally,
 functions, including aggregation ones, can be applied to the result.
 
-A ``SELECT`` statement contains at least a :ref:`selection clause <selection-clause>` and the name of the table on which
-the selection is on (note that CQL does **not** support joins or sub-queries, and thus a select statement only applies to a single
-table). In most cases, a select will also have a :ref:`where clause <where-clause>` and it can optionally have additional
-clauses to :ref:`order <ordering-clause>` or :ref:`limit <limit-clause>` the results. Lastly, :ref:`queries that require
-filtering <allow-filtering>` can be allowed if the ``ALLOW FILTERING`` flag is provided.
+A ``SELECT`` statement contains at least a :ref:`selection clause <selection-clause>` and typically the name of the table
+on which the selection is on (note that CQL does **not** support joins or sub-queries, and thus a select statement only
+applies to a single table). The ``FROM`` clause may be omitted to evaluate expressions without reading from any table
+(see :ref:`SELECT without FROM <select-without-from>`). In most cases, a select will also have a
+:ref:`where clause <where-clause>` and it can optionally have additional clauses to :ref:`order <ordering-clause>` or
+:ref:`limit <limit-clause>` the results. Lastly, :ref:`queries that require filtering <allow-filtering>` can be allowed
+if the ``ALLOW FILTERING`` flag is provided.
 
 If your ``SELECT`` query results in what appears to be missing data, see this :doc:`KB Article </kb/cqlsh-results>` for information. 
 
@@ -508,8 +513,53 @@ of the SELECT statement.
  - If specified, LIMIT is applied to the entire query result.
 
 .. note:: The server may use a different execution plan, as long as it arrives at the same result. For
-  example, conditions in the WHERE clause will limit the candidate row set first by looking up the
-  primary index or a secondary index.
+   example, conditions in the WHERE clause will limit the candidate row set first by looking up the
+   primary index or a secondary index.
+
+
+.. _select-without-from:
+
+``SELECT`` without ``FROM`` :label-note:`ScyllaDB Extension`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``FROM`` clause is optional. When omitted, the ``SELECT`` statement evaluates the given
+expressions without reading from any table and returns a single row with the results.
+
+This is useful for evaluating functions, computing constant expressions, or testing CQL
+syntax without needing an existing table.
+
+Column references and ``SELECT *`` are not allowed without ``FROM``, since there is no
+table to resolve them against. ``WHERE``, ``GROUP BY``, ``ORDER BY``, ``LIMIT``,
+``PER PARTITION LIMIT``, ``ALLOW FILTERING``, ``BYPASS CACHE``, and ``USING TIMEOUT``
+are also not supported without a ``FROM`` clause.
+
+The following selectors are allowed:
+
+- Literals (numbers, strings, booleans)
+- Collections and tuples (lists, sets, maps, tuples of literals)
+- Function calls (e.g. ``now()``, ``toTimestamp(now())``)
+- Aggregate function calls (e.g. ``count(1)``, ``min(5)``, ``max(5)``)
+- ``CAST`` expressions
+- Aliases (``AS``) — optional; if omitted, column names are auto-generated
+
+Examples::
+
+    SELECT 1 AS one, 'hello' AS greeting;
+    SELECT now() AS current_time;
+    SELECT toTimestamp(now()) AS ts;
+    SELECT [1, 2, 3] AS lst, {1, 2, 3} AS st, {'a': 1} AS mp;
+    SELECT (1, 'hello', true) AS tpl;
+    SELECT CAST(1 AS bigint) AS v;
+    SELECT count(1) AS cnt, min(5) AS v;
+
+``AS`` aliases are optional. Without them, column names are auto-generated::
+
+    SELECT 1;
+    SELECT now();
+    SELECT 1, 'hello', true;
+
+.. note:: ``SELECT`` without ``FROM`` is a ScyllaDB CQL extension and is not supported
+   by Apache Cassandra.
 
 
 .. _bypass-cache:
