@@ -11,15 +11,15 @@ Querying data from data is done using a ``SELECT`` statement:
    
    select_statement: SELECT [ DISTINCT ] ( `select_clause` | '*' )
                    : [ FROM `table_name`
-                   : [ WHERE `where_clause` ]
-                   : [ GROUP BY `group_by_clause` ]
-                   : [ ORDER BY `ordering_clause` ]
-                   : [ ORDER BY `vector_column_name` ANN OF `vector` LIMIT `integer` ]
-                   : [ PER PARTITION LIMIT (`integer` | `bind_marker`) ]
-                   : [ LIMIT (`integer` | `bind_marker`) ]
-                   : [ ALLOW FILTERING ]
-                   : [ BYPASS CACHE ]
-                   : [ USING TIMEOUT `timeout` ]
+                   :   [ WHERE `where_clause` ]
+                   :   [ GROUP BY `group_by_clause` ]
+                   :   [ ORDER BY `ordering_clause` ]
+                   :   [ ORDER BY `vector_column_name` ANN OF `vector` LIMIT `integer` ]
+                   :   [ PER PARTITION LIMIT (`integer` | `bind_marker`) ]
+                   :   [ LIMIT (`integer` | `bind_marker`) ]
+                   :   [ ALLOW FILTERING ]
+                   :   [ BYPASS CACHE ]
+                   :   [ USING TIMEOUT `timeout` ]
                    : ]
    select_clause: `selector` [ AS `identifier` ] ( ',' `selector` [ AS `identifier` ] )*
    selector: ( `column_name`
