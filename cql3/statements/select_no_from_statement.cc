@@ -150,7 +150,7 @@ std::unique_ptr<prepared_statement> select_no_from_statement::prepare(data_dicti
     specs.reserve(_select_clause.size());
 
     for (const auto& raw : _select_clause) {
-        auto prepared = expr::prepare_expression(raw->selectable_, db, "", nullptr, nullptr);
+        auto prepared = expr::prepare_expression(raw->selectable_, db, _keyspace, nullptr, nullptr);
 
         auto type = expr::type_of(prepared);
 
@@ -161,7 +161,7 @@ std::unique_ptr<prepared_statement> select_no_from_statement::prepare(data_dicti
             col_name = fmt::format("{}", raw->selectable_);
         }
         specs.push_back(make_lw_shared<column_specification>(
-                "", "", ::make_shared<column_identifier>(col_name, true), type));
+                _keyspace, "", ::make_shared<column_identifier>(col_name, true), type));
         exprs.push_back(std::move(prepared));
     }
 
