@@ -21,6 +21,8 @@
 #include "service/client_state.hh"
 #include "transport/messages/result_message.hh"
 #include "audit/audit.hh"
+#include "auth/permission.hh"
+#include "auth/resource.hh"
 #include "timeout_config.hh"
 #include "exceptions/exceptions.hh"
 #include <seastar/core/thread.hh>
@@ -50,7 +52,31 @@ uint32_t select_no_from_statement::get_bound_terms() const {
 
 future<> select_no_from_statement::check_access(query_processor&, const service::client_state& state) const {
     state.validate_login();
-    return make_ready_future<>();
+    std::vector<shared_ptr<db::functions::function>> used_functions;
+    for (const auto& expr : _exprs) {
+        expr::recurse_until(expr, [&] (const expr::expression& e) {
+            if (auto fc = expr::as_if<expr::function_call>(&e)) {
+                auto func = std::get<shared_ptr<db::functions::function>>(fc->func);
+                if (!func->is_native()) {
+                    used_functions.push_back(func);
+                }
+                if (auto agg = dynamic_pointer_cast<cql3::functions::aggregate_function>(func)) {
+                    auto& a = agg->get_aggregate();
+                    if (a.aggregation_function && !a.aggregation_function->is_native()) {
+                        used_functions.push_back(a.aggregation_function);
+                    }
+                    if (a.state_to_result_function && !a.state_to_result_function->is_native()) {
+                        used_functions.push_back(a.state_to_result_function);
+                    }
+                }
+            }
+            return false;
+        });
+    }
+    for (const auto& func : used_functions) {
+        auto encoded = auth::encode_signature(func->name().name, func->arg_types());
+        co_await state.has_function_access(func->name().keyspace, encoded, auth::permission::EXECUTE);
+    }
 }
 
 bool select_no_from_statement::depends_on(std::string_view, std::optional<std::string_view>) const {
