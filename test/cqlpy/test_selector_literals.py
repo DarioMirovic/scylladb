@@ -76,19 +76,6 @@ def test_simple_literal_type_inference(cql, test_keyspace):
     with pytest.raises(InvalidRequest, match="infer type"):
         cql.execute("SELECT :bindvar AS bv FROM system.local")
 
-# Test that count with a literal argument works with types that can be inferred,
-# and fails when the argument is a bind variable (which cannot self-type).
-def test_count_literal_args(cql, test_keyspace, scylla_only):
-    cql.execute("SELECT count(*) AS cnt FROM system.local")
-    cql.execute("SELECT count(0) AS cnt FROM system.local")
-    cql.execute("SELECT count(1) AS cnt FROM system.local")
-    cql.execute("SELECT count(2) AS cnt FROM system.local")
-    cql.execute("SELECT count('abc') AS cnt FROM system.local")
-    with pytest.raises(InvalidRequest):
-        cql.execute("SELECT count(?) AS cnt FROM system.local")
-    with pytest.raises(InvalidRequest):
-        cql.execute("SELECT count(:bindvar) AS cnt FROM system.local")
-
 # Test SELECT without a FROM clause. Cassandra does not support this syntax.
 def test_select_without_from(cql, scylla_only):
     # Constants
@@ -132,16 +119,53 @@ def test_select_without_from(cql, scylla_only):
     with pytest.raises(SyntaxException):
         cql.execute("SELECT 1 ORDER BY x")
 
-# Test aggregate functions in SELECT without FROM.
+# Test aggregate functions with literal arguments in SELECT ... FROM.
+# system.local has exactly one row, so count(x) -> 1, sum(x) -> x, etc.
+def test_select_aggregates_with_from(cql, test_keyspace, scylla_only):
+    # count
+    assert cql.execute("SELECT count(*) AS cnt FROM system.local").one().cnt == 1
+    assert cql.execute("SELECT count(1) AS cnt FROM system.local").one().cnt == 1
+    assert cql.execute("SELECT count(0) AS cnt FROM system.local").one().cnt == 1
+    assert cql.execute("SELECT count(2) AS cnt FROM system.local").one().cnt == 1
+    assert cql.execute("SELECT count('abc') AS cnt FROM system.local").one().cnt == 1
+    # sum, avg (integer)
+    assert cql.execute("SELECT sum(5) AS v FROM system.local").one().v == 5
+    assert cql.execute("SELECT avg(5) AS v FROM system.local").one().v == 5
+    # min, max (integer)
+    assert cql.execute("SELECT min(5) AS v FROM system.local").one().v == 5
+    assert cql.execute("SELECT max(5) AS v FROM system.local").one().v == 5
+    # min, max (string)
+    assert cql.execute("SELECT min('hello') AS v FROM system.local").one().v == 'hello'
+    assert cql.execute("SELECT max('hello') AS v FROM system.local").one().v == 'hello'
+    # Mixed aggregates and scalar expressions
+    row = cql.execute("SELECT count(1) AS cnt, 42 AS num, min(10) AS mn FROM system.local").one()
+    assert row.cnt == 1
+    assert row.num == 42
+    assert row.mn == 10
+    # Bind variables fail (cannot infer type)
+    with pytest.raises(InvalidRequest):
+        cql.execute("SELECT count(?) AS cnt FROM system.local")
+    with pytest.raises(InvalidRequest):
+        cql.execute("SELECT count(:bindvar) AS cnt FROM system.local")
+
+# Test aggregate functions with literal arguments in SELECT without FROM.
 # Without a FROM clause, aggregates operate over a single virtual row,
 # following the PostgreSQL/MySQL convention:
 #   count(5) -> 1, min(5) -> 5, max(5) -> 5, etc.
 def test_select_aggregates_without_from(cql, scylla_only):
+    # count
+    assert cql.execute("SELECT count(*) AS cnt").one().cnt == 1
     assert cql.execute("SELECT count(1) AS cnt").one().cnt == 1
     assert cql.execute("SELECT count(0) AS cnt").one().cnt == 1
+    assert cql.execute("SELECT count(2) AS cnt").one().cnt == 1
     assert cql.execute("SELECT count('abc') AS cnt").one().cnt == 1
+    # sum, avg (integer)
+    assert cql.execute("SELECT sum(5) AS v").one().v == 5
+    assert cql.execute("SELECT avg(5) AS v").one().v == 5
+    # min, max (integer)
     assert cql.execute("SELECT min(5) AS v").one().v == 5
     assert cql.execute("SELECT max(5) AS v").one().v == 5
+    # min, max (string)
     assert cql.execute("SELECT min('hello') AS v").one().v == 'hello'
     assert cql.execute("SELECT max('hello') AS v").one().v == 'hello'
     # AS aliases are optional - results can be accessed by position
@@ -151,6 +175,11 @@ def test_select_aggregates_without_from(cql, scylla_only):
     assert row.cnt == 1
     assert row.num == 42
     assert row.mn == 10
+    # Bind variables fail (cannot infer type)
+    with pytest.raises(InvalidRequest):
+        cql.execute("SELECT count(?) AS cnt")
+    with pytest.raises(InvalidRequest):
+        cql.execute("SELECT count(:bindvar) AS cnt")
 
 # Test that user-defined functions can be called in SELECT without FROM,
 # both with a keyspace-qualified name and with an unqualified name

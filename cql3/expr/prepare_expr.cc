@@ -1813,6 +1813,13 @@ class assignment_testable_expression : public assignment_testable {
 public:
     explicit assignment_testable_expression(expression e, std::optional<data_type> type_opt) : _e(std::move(e)), _type_opt(std::move(type_opt)) {}
     virtual test_result test_assignment(data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) const override {
+        // When a type has been inferred, prefer EXACT_MATCH for the
+        // inferred type to resolve overload ambiguity.
+        // For non-matching types, fall through to the expression's
+        // own test_assignment which may still return WEAKLY_ASSIGNABLE.
+        if (_type_opt && *_type_opt == receiver.type->underlying_type()) {
+            return test_result::EXACT_MATCH;
+        }
         return expr::test_assignment(_e, db, keyspace, schema_opt, receiver);
     }
     virtual vector_test_result test_assignment_any_size_float_vector() const override {
