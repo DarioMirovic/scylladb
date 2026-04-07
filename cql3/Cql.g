@@ -1691,6 +1691,17 @@ value returns [uexpression value]
     | e=marker             { $value = std::move(e); }
     ;
 
+// Like value, but without tupleLiteral. Used for the LHS of reversed
+// restrictions (e.g. "4 = col") to avoid grammar ambiguity with tuple
+// and parenthesized-relation alternatives.
+nonTupleValue returns [uexpression value]
+    : c=constant           { $value = std::move(c); }
+    | l=collectionLiteral  { $value = std::move(l); }
+    | u=usertypeLiteral    { $value = std::move(u); }
+    | K_NULL               { $value = make_untyped_null(); }
+    | e=marker             { $value = std::move(e); }
+    ;
+
 marker returns [uexpression value]
     : ':' id=ident         { $value = new_bind_variables(id); }
     | QMARK                { $value = new_bind_variables(shared_ptr<cql3::column_identifier>{}); }
@@ -1834,6 +1845,12 @@ columnCondition returns [uexpression e]
                             std::move(values));
                 }
         )
+    | v=nonTupleValue op=relationType key=subscriptExpr {
+                    e = binary_operator(
+                            std::move(v),
+                            op,
+                            std::move(key));
+                }
     ;
 
 properties[cql3::statements::property_definitions& props]
@@ -1956,6 +1973,8 @@ relation returns [uexpression e]
           }
       )
     | '(' e1=relation ')' { $e = std::move(e1); }
+    | v=nonTupleValue type=relationType name=cident
+        { $e = binary_operator(std::move(v), type, unresolved_identifier{std::move(name)}); }
     ;
 
 tupleOfIdentifiers returns [tuple_constructor tup]

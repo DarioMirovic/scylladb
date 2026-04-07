@@ -1910,6 +1910,15 @@ static lw_shared_ptr<column_specification> get_lhs_receiver(const expression& pr
                 ::make_shared<column_identifier>(format("{:user}", fun_call), true),
                 return_type);
         },
+        [&](const constant& c) -> lw_shared_ptr<column_specification> {
+            return make_lw_shared<column_specification>(
+                schema.ks_name(), schema.cf_name(),
+                ::make_shared<column_identifier>(format("{:user}", c), true),
+                c.type);
+        },
+        [&](const bind_variable& bv) -> lw_shared_ptr<column_specification> {
+            return bv.receiver;
+        },
         [](const auto& other) -> lw_shared_ptr<column_specification> {
             on_internal_error(expr_logger, format("get_lhs_receiver: unexpected expression: {}", other));
         },
@@ -2040,7 +2049,28 @@ optimize_like(const expression& e) {
 binary_operator prepare_binary_operator(binary_operator binop, data_dictionary::database db, const schema& table_schema) {
     std::optional<expression> prepared_lhs_opt = try_prepare_expression(binop.lhs, db, table_schema.ks_name(), &table_schema, {});
     if (!prepared_lhs_opt) {
-        throw exceptions::invalid_request_exception(fmt::format("Could not infer type of {}", binop.lhs));
+        // The LHS could not be prepared without a type hint (e.g. it is a constant like `4`
+        // or a bind marker `?`).
+        // Strategy 1: Try to infer a default type from the LHS itself (works for constants).
+        auto inferred = infer_type(binop.lhs, db, table_schema.ks_name(), &table_schema);
+        if (inferred) {
+            prepared_lhs_opt = try_prepare_expression(binop.lhs, db, table_schema.ks_name(), &table_schema, make_inferred_receiver(std::move(*inferred)));
+        }
+        if (!prepared_lhs_opt) {
+            // Strategy 2: Try to prepare the RHS first (e.g. `? = col` — the RHS is a column
+            // whose type can serve as the receiver for the LHS bind marker).
+            auto prepared_rhs_opt = try_prepare_expression(binop.rhs, db, table_schema.ks_name(), &table_schema, {});
+            if (prepared_rhs_opt) {
+                auto rhs_type = type_of(*prepared_rhs_opt);
+                if (rhs_type) {
+                    prepared_lhs_opt =
+                        try_prepare_expression(binop.lhs, db, table_schema.ks_name(), &table_schema, make_inferred_receiver(std::move(rhs_type)));
+                }
+            }
+        }
+        if (!prepared_lhs_opt) {
+            throw exceptions::invalid_request_exception(fmt::format("Could not infer type of {}", binop.lhs));
+        }
     }
     auto& prepared_lhs = *prepared_lhs_opt;
     lw_shared_ptr<column_specification> lhs_receiver = get_lhs_receiver(prepared_lhs, table_schema);
