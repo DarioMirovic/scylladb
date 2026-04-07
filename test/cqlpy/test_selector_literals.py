@@ -194,3 +194,60 @@ def test_udf_without_from(cql, test_keyspace, scylla_only):
         with new_cql(cql) as ncql:
             ncql.execute(f"USE {test_keyspace}")
             assert ncql.execute(f"SELECT {fun}(1) AS v").one().v == 101
+
+# --------------------------------------------------------------------------
+# Tests for binary comparison expressions in the SELECT clause.
+# For example, "SELECT col = 4 FROM t" or "SELECT 4 = col FROM t".
+# These return a boolean value per row.
+# --------------------------------------------------------------------------
+
+def test_select_comparison_normal(cql, test_keyspace, scylla_only):
+    """SELECT col = <constant> should return a boolean"""
+    from .util import new_test_table, unique_key_int
+    with new_test_table(cql, test_keyspace, "a int PRIMARY KEY, b int") as table:
+        p = unique_key_int()
+        cql.execute(f"INSERT INTO {table} (a, b) VALUES ({p}, 10)")
+        rows = list(cql.execute(f"SELECT b = 10 AS match FROM {table} WHERE a = {p}"))
+        assert rows[0].match == True
+        rows = list(cql.execute(f"SELECT b = 99 AS match FROM {table} WHERE a = {p}"))
+        assert rows[0].match == False
+
+
+def test_select_comparison_reversed(cql, test_keyspace, scylla_only):
+    """SELECT <constant> = col should return a boolean (reversed operand order)"""
+    from .util import new_test_table, unique_key_int
+    with new_test_table(cql, test_keyspace, "a int PRIMARY KEY, b int") as table:
+        p = unique_key_int()
+        cql.execute(f"INSERT INTO {table} (a, b) VALUES ({p}, 10)")
+        rows = list(cql.execute(f"SELECT 10 = b AS match FROM {table} WHERE a = {p}"))
+        assert rows[0].match == True
+        rows = list(cql.execute(f"SELECT 99 = b AS match FROM {table} WHERE a = {p}"))
+        assert rows[0].match == False
+
+
+def test_select_comparison_inequality(cql, test_keyspace, scylla_only):
+    """SELECT col > <constant> and SELECT <constant> < col"""
+    from .util import new_test_table, unique_key_int
+    with new_test_table(cql, test_keyspace, "a int PRIMARY KEY, b int") as table:
+        p = unique_key_int()
+        cql.execute(f"INSERT INTO {table} (a, b) VALUES ({p}, 10)")
+        # col > 5 should be true
+        rows = list(cql.execute(f"SELECT b > 5 AS gt FROM {table} WHERE a = {p}"))
+        assert rows[0].gt == True
+        # 5 < col should also be true (reversed)
+        rows = list(cql.execute(f"SELECT 5 < b AS lt FROM {table} WHERE a = {p}"))
+        assert rows[0].lt == True
+        # col > 20 should be false
+        rows = list(cql.execute(f"SELECT b > 20 AS gt FROM {table} WHERE a = {p}"))
+        assert rows[0].gt == False
+        # 20 < col should also be false
+        rows = list(cql.execute(f"SELECT 20 < b AS lt FROM {table} WHERE a = {p}"))
+        assert rows[0].lt == False
+
+
+def test_select_comparison_without_from(cql, scylla_only):
+    """SELECT <constant> = <constant> without a FROM clause"""
+    assert cql.execute("SELECT 1 = 1 AS eq").one().eq == True
+    assert cql.execute("SELECT 1 = 2 AS eq").one().eq == False
+    assert cql.execute("SELECT 1 < 2 AS lt").one().lt == True
+    assert cql.execute("SELECT 2 < 1 AS lt").one().lt == False

@@ -434,18 +434,25 @@ selector returns [shared_ptr<raw_selector> s]
     ;
 
 unaliasedSelector returns [uexpression tmp]
-    :  ( c=cident                                  { tmp = unresolved_identifier{std::move(c)}; }
-       | v=value                                   { tmp = std::move(v); }
-       | K_COUNT '(' countArgument ')'             { tmp = make_count_rows_function_expression(); }
-       | K_WRITETIME '(' c=cident ')'              { tmp = column_mutation_attribute{column_mutation_attribute::attribute_kind::writetime,
+    : lhs=selectorAtom { tmp = std::move(lhs); }
+      ( op=relationType rhs=selectorAtom
+        { tmp = binary_operator(std::move(tmp), op, std::move(rhs)); }
+      )?
+    ;
+
+selectorAtom returns [uexpression e]
+    :  ( c=cident                                  { e = unresolved_identifier{std::move(c)}; }
+       | v=value                                   { e = std::move(v); }
+       | K_COUNT '(' countArgument ')'             { e = make_count_rows_function_expression(); }
+       | K_WRITETIME '(' c=cident ')'              { e = column_mutation_attribute{column_mutation_attribute::attribute_kind::writetime,
                                                                                               unresolved_identifier{std::move(c)}}; }
-       | K_TTL       '(' c=cident ')'              { tmp = column_mutation_attribute{column_mutation_attribute::attribute_kind::ttl,
+       | K_TTL       '(' c=cident ')'              { e = column_mutation_attribute{column_mutation_attribute::attribute_kind::ttl,
                                                                                               unresolved_identifier{std::move(c)}}; }
-       | f=functionName args=selectionFunctionArgs { tmp = function_call{std::move(f), std::move(args)}; }
-       | K_CAST      '(' arg=unaliasedSelector K_AS t=native_type ')'  { tmp = cast{.style = cast::cast_style::sql, .arg = std::move(arg), .type = std::move(t)}; }
+       | f=functionName args=selectionFunctionArgs { e = function_call{std::move(f), std::move(args)}; }
+       | K_CAST      '(' arg=unaliasedSelector K_AS t=native_type ')'  { e = cast{.style = cast::cast_style::sql, .arg = std::move(arg), .type = std::move(t)}; }
        )
-       ( '.' fi=cident { tmp = field_selection{std::move(tmp), std::move(fi)}; }
-       | '[' sub=term ']' { tmp = subscript{std::move(tmp), std::move(sub)}; }
+       ( '.' fi=cident { e = field_selection{std::move(e), std::move(fi)}; }
+       | '[' sub=term ']' { e = subscript{std::move(e), std::move(sub)}; }
        )*
     ;
 

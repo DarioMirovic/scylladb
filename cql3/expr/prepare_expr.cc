@@ -1495,6 +1495,36 @@ try_prepare_expression(const expression& expr, data_dictionary::database db, con
                            receiver->type->name(), receiver->name->text()));
             }
 
+            if (!schema_opt) {
+                // No schema available (e.g. SELECT 1 = 1 without FROM).
+                // Try to prepare both sides without a schema and fold constants.
+                auto prepared_lhs = try_prepare_expression(binop.lhs, db, keyspace, nullptr, {});
+                if (!prepared_lhs) {
+                    auto inferred = infer_type(binop.lhs, db, keyspace, nullptr);
+                    if (inferred) {
+                        prepared_lhs = try_prepare_expression(binop.lhs, db, keyspace, nullptr, make_inferred_receiver(std::move(*inferred)));
+                    }
+                }
+                if (!prepared_lhs) {
+                    return std::nullopt;
+                }
+                auto prepared_rhs = try_prepare_expression(binop.rhs, db, keyspace, nullptr, {});
+                if (!prepared_rhs) {
+                    auto inferred = infer_type(binop.rhs, db, keyspace, nullptr);
+                    if (inferred) {
+                        prepared_rhs = try_prepare_expression(binop.rhs, db, keyspace, nullptr, make_inferred_receiver(std::move(*inferred)));
+                    }
+                }
+                if (!prepared_rhs) {
+                    return std::nullopt;
+                }
+                binary_operator result(std::move(*prepared_lhs), binop.op, std::move(*prepared_rhs), binop.order);
+                if (is<constant>(result.lhs) && is<constant>(result.rhs) && result.order == comparison_order::cql) {
+                    return constant(evaluate(result, query_options::DEFAULT), boolean_type);
+                }
+                return result;
+            }
+
             binary_operator result = prepare_binary_operator(binop, db, *schema_opt);
 
             // A binary operator where both sides of the equation are known can be evaluated to a boolean value.

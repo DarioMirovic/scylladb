@@ -37,8 +37,8 @@ selectable_processes_selection(const expr::expression& selectable) {
         [&] (const expr::conjunction& conj) -> bool {
             on_internal_error(slogger, "no way to express 'SELECT a AND b' in the grammar yet");
         },
-        [&] (const expr::binary_operator& conj) -> bool {
-            on_internal_error(slogger, "no way to express 'SELECT a binop b' in the grammar yet");
+        [&] (const expr::binary_operator&) -> bool {
+            return true;
         },
         [] (const expr::subscript&) -> bool {
             return true;
