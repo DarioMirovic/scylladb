@@ -115,7 +115,7 @@ class ManagerClient:
     def driver_close(self) -> None:
         """Disconnect from cluster"""
         for cluster in self.exclusive_clusters:
-            cluster.shutdown()
+            safe_driver_shutdown(cluster)
         self.exclusive_clusters.clear()
         if self.ccluster is not None:
             logger.debug("shutting down driver")
