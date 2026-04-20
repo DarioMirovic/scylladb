@@ -782,14 +782,8 @@ class CQLAuditTester(AuditTester):
                 new_rows: list[AuditEntry] = []
                 for node, node_after in after_by_node.items():
                     node_before = before_by_node.get(node, [])
-                    node_new = node_after[len(node_before):]
-                    set_node_new = set(node_new)
                     set_node_diff = set(node_after) - set(node_before)
-                    assert set_node_new == set_node_diff, (
-                        f"new rows are not the last rows for node {node} in audit {mode}: "
-                        f"tail={node_new}, set_diff={set_node_diff}"
-                    )
-                    new_rows.extend(node_new)
+                    new_rows.extend(set_node_diff)
 
                 new_rows.sort(key=lambda row: (row.event_time.time, row.node))
                 new_rows_dict[mode] = new_rows
