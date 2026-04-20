@@ -39,6 +39,8 @@ import typing
 import uuid
 import yaml
 
+from test.pylib.driver_utils import safe_driver_shutdown
+
 ################################################################################
 # Common aliases.
 
@@ -612,7 +614,7 @@ async def main(seed: int, partition_count: Optional[int], row_count: Optional[in
                     if list(result_rows) != [row]:
                         raise RuntimeError("Expected: {}, got: {}".format([row], result_rows))
         finally:
-            cluster.shutdown()
+            safe_driver_shutdown(cluster)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -58,7 +58,7 @@ async def get_ready_maintenance_session(socket_path: str, timeout: int = 60):
             session.execute("SELECT key FROM system.local LIMIT 1")
             return session
         except Exception:
-            c.shutdown()
+            safe_driver_shutdown(c)
             return None
 
     session = await wait_for(try_connect, deadline)
@@ -90,7 +90,7 @@ async def connect_with_credentials(ip: str, username: str, password: str, timeou
         try:
             return c.connect()
         except NoHostAvailable:
-            c.shutdown()
+            safe_driver_shutdown(c)
             return None
     return await wait_for(try_connect, time.time() + timeout)
 
@@ -240,7 +240,7 @@ async def test_no_default_superuser_maintenance_socket_ops(manager: ManagerClien
         except Unauthorized:
             return True
         finally:
-            c.shutdown()
+            safe_driver_shutdown(c)
 
     await wait_for(check_superuser_revoked, time.time() + 60)
 
@@ -257,11 +257,11 @@ async def test_no_default_superuser_maintenance_socket_ops(manager: ManagerClien
                         auth_provider=PlainTextAuthProvider(username=new_role, password=new_role_password))
         try:
             c.connect()
-            c.shutdown()
             return None  # Still cached, retry
         except NoHostAvailable:
-            c.shutdown()
             return True
+        finally:
+            safe_driver_shutdown(c)
 
     await wait_for(check_role_dropped, time.time() + 60)
 

@@ -19,7 +19,7 @@ from cassandra.policies import WhiteListRoundRobinPolicy
 from cassandra.protocol import ResultMessage
 
 from test.cluster.auth_cluster import extra_scylla_config_options as auth_config
-from test.pylib.manager_client import ManagerClient
+from test.pylib.manager_client import ManagerClient, safe_driver_shutdown
 from test.pylib.util import unique_name
 
 
@@ -138,7 +138,7 @@ def _prepare_and_execute(host: str, query: str) -> tuple[bytes, bool, int]:
             return prepared_metadata_id, captured["metadata_changed"], len(rows)
         finally:
             session.shutdown()
-            cluster.shutdown()
+            safe_driver_shutdown(cluster)
 
 
 @pytest.mark.asyncio

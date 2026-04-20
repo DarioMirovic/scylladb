@@ -7,7 +7,7 @@
 import asyncio
 import pytest
 from test.cluster.util import new_test_keyspace, new_test_table
-from test.pylib.manager_client import ManagerClient
+from test.pylib.manager_client import ManagerClient, safe_driver_shutdown
 from test.pylib.util import wait_for
 from cassandra.connection import UnixSocketEndPoint
 from cassandra.policies import WhiteListRoundRobinPolicy
@@ -89,4 +89,4 @@ async def test_describe_cluster_sanity(manager: ManagerClient, mode: str):
         assert describe_results[0].cluster == system_local_results[0].cluster_name
     finally:
         if mode == "maintenance":
-            cluster.shutdown()
+            safe_driver_shutdown(cluster)
