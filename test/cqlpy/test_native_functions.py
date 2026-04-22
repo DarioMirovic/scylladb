@@ -191,3 +191,24 @@ def test_set_intersection_fn(cql, tbl_set, scylla_only):
         cql.execute(f"SELECT set_intersection(s1, p) FROM {tbl_set} WHERE p={p1}")
     with pytest.raises(InvalidRequest, match='both arguments are of the same set type'):
         cql.execute(f"SELECT set_intersection(s1, s3) FROM {tbl_set} WHERE p={p1}")
+
+# When an unqualified native function (e.g. intAsBlob) is called from a query
+# whose target table is in the `system` keyspace, overload resolution must not
+# add the same candidate twice, once via the native ("system") name and once
+# via the current keyspace name, which is also "system". Duplicate candidates
+# trigger a spurious "Ambiguous call to function" error, especially with bind
+# markers, where overload resolution cannot short-circuit on EXACT_MATCH.
+def test_native_function_in_system_keyspace_query(cql):
+    # Literal argument: EXACT_MATCH fast path.
+    assert [(b'\x00\x00\x00\x04',)] == list(
+        cql.execute("SELECT intAsBlob(4) FROM system.local"))
+    # Bind marker: WEAKLY_ASSIGNABLE path, where the duplicate-candidate bug bites.
+    stmt = cql.prepare("SELECT intAsBlob(?) FROM system.local")
+    assert [(b'\x00\x00\x00\x04',)] == list(cql.execute(stmt, [4]))
+    # Nested unqualified calls.
+    stmt = cql.prepare("SELECT blobAsInt(intAsBlob(?)) FROM system.local")
+    assert [(4,)] == list(cql.execute(stmt, [4]))
+    # Fully-qualified form: regression guard for the `else` branch of the
+    # overload-resolution lookup.
+    assert [(b'\x00\x00\x00\x04',)] == list(
+        cql.execute("SELECT system.intAsBlob(4) FROM system.local"))
