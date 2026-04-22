@@ -469,8 +469,16 @@ functions::get(data_dictionary::database db,
     };
     if (!name.has_keyspace()) {
         // add 'SYSTEM' (native) candidates
-        add_declared(name.as_native_function());
-        add_declared(function_name(keyspace, name.name));
+        auto native = name.as_native_function();
+        add_declared(native);
+        // Avoid adding the same candidates twice when the current keyspace is
+        // the system keyspace: in that case `function_name(keyspace, name.name)`
+        // is equal to `name.as_native_function()` and would resolve to the same
+        // entries in `_declared`, leading to a spurious "Ambiguous call" error.
+        auto user_name = function_name(keyspace, name.name);
+        if (user_name != native) {
+            add_declared(user_name);
+        }
     } else {
         // function name is fully qualified (keyspace + name)
         add_declared(name);
