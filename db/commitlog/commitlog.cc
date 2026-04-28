@@ -1821,8 +1821,17 @@ future<> db::commitlog::segment_manager::oversized_allocation(entry_writer& writ
                         s = co_await with_timeout(timeout, s->sync());
                         continue;
                     case write_result::no_space:
-                        [[fallthrough]];
+                        clogger.debug("oversized fragment {} for id={} off={}/{} rejected with no_space "
+                                            "(seg_pos={}, to_write={}, avail={}, max_size={}); retrying on a new segment",
+                                            i, id, off, data_size, s->position(), to_write, avail, max_size);
+                        strm = saved_strm;
+                        co_await s->close();
+                        s = co_await get_segment();
+                        continue;
                     case write_result::too_large:
+                        clogger.error("oversized fragment {} for id={} off={}/{} rejected with too_large "
+                                            "(seg_pos={}, to_write={}, avail={}, max_size={}, max_mutation_size={})",
+                                            i, id, off, data_size, s->position(), to_write, avail, max_size, max_mutation_size);
                         assert(0); // should not reach
                         failed = true;
                         break;
